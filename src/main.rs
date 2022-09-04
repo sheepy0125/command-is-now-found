@@ -8,10 +8,16 @@
 /* Imports */
 extern crate os_release;
 use clap::Command;
+extern crate pretty_env_logger;
+#[macro_use]
+extern crate log;
+use env_logger::{Builder as LoggerBuilder, Target};
+use log::LevelFilter;
 use os_release::OsRelease;
 use reqwest::{blocking::Client, redirect::Policy as RedirectPolicy};
 use std::{
     fmt::{Display, Formatter},
+    io::Write,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -44,7 +50,7 @@ enum CommandWasError {
     #[error("Couldn't auto-detect: {0}")]
     AutoDetectError(String),
     /// Was not allowed to auto-detect something
-    #[error("you shouldn't see this message, wasn't allowed to auto detect")]
+    #[error("Wasn't allowed to auto detect")]
     NotAllowedToAutoFind,
     /// Unknown error
     #[error("What? An unknown error occurred, sorry(!): {0}")]
@@ -58,15 +64,18 @@ impl From<reqwest::Error> for CommandWasError {
 }
 /// Log errors
 impl CommandWasError {
-    /// Errors to not log
+    /// Errors to not log (in verbose mode they get logged)
     const NO_LOG_ERRORS: [CommandWasError; 1] = [CommandWasError::NotAllowedToAutoFind];
 
     /// Won't log errors that shouldn't be logged (in NO_LOG_ERRORS)
     /// I promise this won't be as bad (soon!)
-    fn log_error(e: CommandWasError) {
+    fn log_error(level: &str, e: CommandWasError) {
         if !CommandWasError::NO_LOG_ERRORS.contains(&e) {
-            println!("{}", e);
+            error!(target: level, "{}", e);
+            return;
         }
+        // Not supposed to log, but the verbose users get special treatment
+        debug!(target: level, "{}", e);
     }
 }
 
@@ -114,6 +123,7 @@ struct Settings {
     find_command: bool,
     preferred_distribution: Distribution,
     find_preferred_distribution: bool,
+    verbose: bool,
 }
 impl Default for Settings {
     /// DEBUG default settings
@@ -123,7 +133,28 @@ impl Default for Settings {
             find_command: false,
             preferred_distribution: Distribution::All,
             find_preferred_distribution: true,
+            verbose: true,
         }
+    }
+}
+impl Display for Settings {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "\
+            Settings:\n \
+            Run install command: {}\n \
+            Find command: {}\n \
+            Preferred distribution: {}\n \
+            Find preferred distribution: {}\n \
+            Verbose: {}\n \
+            ",
+            self.run_install_command,
+            self.find_command,
+            self.preferred_distribution,
+            self.find_preferred_distribution,
+            self.verbose
+        )
     }
 }
 
@@ -225,22 +256,48 @@ impl Scraper {
     }
 }
 
-fn main() {
-    let settings = Settings::default();
+fn run(settings: Settings) {
+    // Find information
+    // Note: If we aren't allowed to find the information, it won't look for it
+    // and we can just set it to a fallback
     let information_finder = InformationFinder::new(settings);
-
     let distribution = match information_finder.find_distribution() {
         Ok(distribution) => distribution,
         Err(e) => {
-            CommandWasError::log_error(e);
+            CommandWasError::log_error("finding distribution", e);
             settings.preferred_distribution
         }
     };
-    println!("{:#?}", distribution);
+    debug!("Found distribution: {}", distribution);
 
     // let scraper = Scraper::new(format!("rust"), settings);
-    // match scraper.get_html_response() {
-    // Ok(resp) => println!("resp {}", resp),
-    // Err(e) => println!("error {}", e),
-    // }
+    // let resp = match scraper.get_html_response() {
+    //     Ok(resp) => resp,
+    //     Err(e) => {
+    //         CommandWasError::log_error("scraper", e);
+    //         return;
+    //     }
+    // };
+}
+
+fn main() {
+    // Get settings
+    let settings = Settings::default();
+
+    // Logger
+    LoggerBuilder::from_default_env()
+        .format_target(true)
+        .filter(
+            None,
+            match settings.verbose {
+                true => LevelFilter::Debug,
+                false => LevelFilter::Info,
+            },
+        )
+        .target(Target::Stdout)
+        .init();
+
+    debug!("{}", settings);
+
+    run(Settings::default());
 }
