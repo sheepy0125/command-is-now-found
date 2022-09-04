@@ -6,16 +6,23 @@
 
 /***** Setup *****/
 /* Imports */
+extern crate os_release;
+use clap::Command;
+use os_release::OsRelease;
 use reqwest::{blocking::Client, redirect::Policy as RedirectPolicy};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    fmt::{Display, Formatter},
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use thiserror::Error;
 
 /* Enums */
 /// Error
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 enum CommandWasError {
     /// Request error
     #[error("There was an error with requesting: {0}")]
@@ -33,31 +40,80 @@ enum CommandWasError {
         Hint: Run with --all-distributions to get all distributions"
     )]
     NoInformationForSelectedDistributionError,
+    /// Couldn't auto-detect something
+    #[error("Couldn't auto-detect: {0}")]
+    AutoDetectError(String),
+    /// Was not allowed to auto-detect something
+    #[error("you shouldn't see this message, wasn't allowed to auto detect")]
+    NotAllowedToAutoFind,
     /// Unknown error
     #[error("What? An unknown error occurred, sorry(!): {0}")]
     UnknownError(String),
 }
+/// Implicitly convert reqwest errors
 impl From<reqwest::Error> for CommandWasError {
     fn from(e: reqwest::Error) -> CommandWasError {
         CommandWasError::RequestError(format!("{}", e))
     }
 }
+/// Log errors
+impl CommandWasError {
+    /// Errors to not log
+    const NO_LOG_ERRORS: [CommandWasError; 1] = [CommandWasError::NotAllowedToAutoFind];
+
+    /// Won't log errors that shouldn't be logged (in NO_LOG_ERRORS)
+    /// I promise this won't be as bad (soon!)
+    fn log_error(e: CommandWasError) {
+        if !CommandWasError::NO_LOG_ERRORS.contains(&e) {
+            println!("{}", e);
+        }
+    }
+}
+
+use CommandWasError::*;
 
 /// Distribution
+/// There are actually more on the website, however, if they're from the same package
+/// manager there's an almost certain chance they will be the same command
+#[derive(Debug, Clone, Copy)]
 enum Distribution {
     Arch,
     Debian,
     Fedora,
     Alpine,
     CentOS,
+    /// Will show information for all distributions
+    All,
+}
+/// Displaying and converting to and from Strings
+impl FromStr for Distribution {
+    type Err = ();
+
+    fn from_str(input: &str) -> Result<Distribution, Self::Err> {
+        use Distribution::*;
+        match input {
+            "arch" => Ok(Arch),
+            "debian" => Ok(Debian),
+            "fedora" => Ok(Fedora),
+            "alpine" => Ok(Alpine),
+            "centos" => Ok(CentOS),
+            _ => Err(()),
+        }
+    }
+}
+impl Display for Distribution {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "{:#?}", self)
+    }
 }
 
 /// Settings
+#[derive(Clone, Copy)]
 struct Settings {
     run_install_command: bool,
     find_command: bool,
     preferred_distribution: Distribution,
-    verbose: bool,
+    find_preferred_distribution: bool,
 }
 impl Default for Settings {
     /// DEBUG default settings
@@ -65,8 +121,56 @@ impl Default for Settings {
         Settings {
             run_install_command: false,
             find_command: false,
-            preferred_distribution: Distribution::Arch,
-            verbose: true,
+            preferred_distribution: Distribution::All,
+            find_preferred_distribution: true,
+        }
+    }
+}
+
+/***** Information finder *****/
+struct InformationFinder {
+    settings: Settings,
+}
+impl InformationFinder {
+    /// Create a new information finder
+    fn new(settings: Settings) -> InformationFinder {
+        InformationFinder { settings: settings }
+    }
+
+    /// Find the distribution
+    /// If disallowed in settings, it won't auto-detect and instead use the preferred,
+    /// it's okay to unwrap in this case!
+    fn find_distribution(&self) -> Result<Distribution, CommandWasError> {
+        // Are we allowed to?
+        if !self.settings.find_preferred_distribution {
+            return Err(NotAllowedToAutoFind);
+        }
+
+        // We can find it from os-release's ID
+        // See https://www.freedesktop.org/software/systemd/man/os-release.html
+        let release = match OsRelease::new() {
+            Ok(release) => release,
+            Err(e) => return Err(AutoDetectError(format!("{}", e))),
+        };
+        let mut distribution = release.id_like;
+        // Sometimes, the id_like won't be specified (this API will return an empty string in that case)
+        // So, we'll need to use the other ID
+        if (&distribution).is_empty() {
+            distribution = release.id;
+        }
+        // In any case that that's also nonexistent (still empty!), raise an error
+        if (&distribution).is_empty() {
+            return Err(AutoDetectError(format!(
+                "os-release's id and id_like appear to be empty"
+            )));
+        }
+
+        match Distribution::from_str(&distribution) {
+            Ok(string_distribution) => Ok(string_distribution),
+            Err(_) => Err(AutoDetectError(format!(
+                "Distribution detected ({}) is not a valid distribution",
+                &distribution
+            ))),
         }
     }
 }
@@ -92,16 +196,15 @@ impl Scraper {
         let redirect_policy = {
             let redirected = redirected.clone();
             RedirectPolicy::custom(move |attempt| {
-                let action = attempt.stop();
                 redirected.store(true, Ordering::Relaxed);
-                action
+                attempt.stop()
             })
         };
         // Handle the reqwest error as an unknown error here
         let client = match Client::builder().redirect(redirect_policy).build() {
             Ok(client) => client,
             Err(e) => {
-                return Err(CommandWasError::UnknownError(format!(
+                return Err(UnknownError(format!(
                     "Could not make request client: {}",
                     e
                 )));
@@ -115,18 +218,29 @@ impl Scraper {
         {
             Ok(text) => match redirected.load(Ordering::Relaxed) {
                 false => Ok(text),
-                true => Err(CommandWasError::NoInformationError),
+                true => Err(NoInformationError),
             },
-            Err(e) => Err(CommandWasError::RequestError(format!("{}", e))),
+            Err(e) => Err(RequestError(format!("{}", e))),
         }
     }
 }
 
 fn main() {
     let settings = Settings::default();
-    let scraper = Scraper::new(format!("rust"), settings);
-    match scraper.get_html_response() {
-        Ok(resp) => println!("resp {}", resp),
-        Err(e) => println!("error {}", e),
-    }
+    let information_finder = InformationFinder::new(settings);
+
+    let distribution = match information_finder.find_distribution() {
+        Ok(distribution) => distribution,
+        Err(e) => {
+            CommandWasError::log_error(e);
+            settings.preferred_distribution
+        }
+    };
+    println!("{:#?}", distribution);
+
+    // let scraper = Scraper::new(format!("rust"), settings);
+    // match scraper.get_html_response() {
+    // Ok(resp) => println!("resp {}", resp),
+    // Err(e) => println!("error {}", e),
+    // }
 }

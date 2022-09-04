@@ -7,5 +7,6 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "3.2.20", features = ["derive"] }
+os-release = "0.1.0"
 reqwest = { version = "0.11.11", features = ["blocking"] }
 thiserror = "1.0.33"
