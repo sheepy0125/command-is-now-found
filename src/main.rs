@@ -6,25 +6,29 @@
 
 /***** Setup *****/
 /* Imports */
-extern crate os_release;
-use clap::Command;
-extern crate pretty_env_logger;
-#[macro_use]
-extern crate log;
-use env_logger::{Builder as LoggerBuilder, Target};
-use log::LevelFilter;
-use os_release::OsRelease;
-use reqwest::{blocking::Client, redirect::Policy as RedirectPolicy};
+use thiserror::Error;
+
 use std::{
     fmt::{Display, Formatter},
-    io::Write,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
-use thiserror::Error;
+
+extern crate os_release;
+use os_release::OsRelease;
+
+#[macro_use]
+extern crate log;
+extern crate pretty_env_logger;
+use env_logger::{Builder as LoggerBuilder, Target};
+use log::LevelFilter;
+
+use clap::{ArgEnum, Parser};
+
+use reqwest::{blocking::Client, redirect::Policy as RedirectPolicy};
 
 /* Enums */
 /// Error
@@ -68,7 +72,6 @@ impl CommandWasError {
     const NO_LOG_ERRORS: [CommandWasError; 1] = [CommandWasError::NotAllowedToAutoFind];
 
     /// Won't log errors that shouldn't be logged (in NO_LOG_ERRORS)
-    /// I promise this won't be as bad (soon!)
     fn log_error(level: &str, e: CommandWasError) {
         if !CommandWasError::NO_LOG_ERRORS.contains(&e) {
             error!(target: level, "{}", e);
@@ -84,7 +87,7 @@ use CommandWasError::*;
 /// Distribution
 /// There are actually more on the website, however, if they're from the same package
 /// manager there's an almost certain chance they will be the same command
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, ArgEnum, Clone, Copy)]
 enum Distribution {
     Arch,
     Debian,
@@ -94,18 +97,28 @@ enum Distribution {
     /// Will show information for all distributions
     All,
 }
+/// Default
+impl Default for Distribution {
+    fn default() -> Self {
+        Self::All
+    }
+}
 /// Displaying and converting to and from Strings
+impl Distribution {
+    /// Used for Clap (probably not the best way of doing it)
+    const POSSIBLE_VALUES: &'static [&'static str] =
+        &["arch", "debian", "fedora", "alpine", "centos"];
+}
 impl FromStr for Distribution {
     type Err = ();
 
-    fn from_str(input: &str) -> Result<Distribution, Self::Err> {
-        use Distribution::*;
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
         match input {
-            "arch" => Ok(Arch),
-            "debian" => Ok(Debian),
-            "fedora" => Ok(Fedora),
-            "alpine" => Ok(Alpine),
-            "centos" => Ok(CentOS),
+            "arch" => Ok(Self::Arch),
+            "debian" => Ok(Self::Debian),
+            "fedora" => Ok(Self::Fedora),
+            "alpine" => Ok(Self::Alpine),
+            "centos" => Ok(Self::CentOS),
             _ => Err(()),
         }
     }
@@ -116,42 +129,71 @@ impl Display for Distribution {
     }
 }
 
-/// Settings
-#[derive(Clone, Copy)]
-struct Settings {
-    run_install_command: bool,
+/// Arguments
+#[derive(Parser, Clone)]
+struct Arguments {
+    /// The command to find (if auto-find is disabled)
+    #[clap(short, short = 'c', long = "command", conflicts_with("find-command"))]
+    command: String,
+
+    /// Preferred distribution (if auto-find is disabled)
+    ///
+    /// Defaults to all distributions if not given
+    #[clap(
+        short = 'd',
+        long = "preferred-distribution",
+        possible_values = Distribution::POSSIBLE_VALUES,
+        conflicts_with = "find-preferred-distribution",
+        ignore_case = true
+    )]
+    #[clap(arg_enum)]
+    preferred_distribution: Option<Distribution>,
+
+    /// Automatically find the command to find
+    ///
+    /// This will detect the command from your shell history file (whatever command was
+    /// ran before this program)
+    #[clap(short = 'f', long = "find-command", default_value = "false")]
     find_command: bool,
-    preferred_distribution: Distribution,
+
+    /// Automatically run the command that was found
+    ///
+    /// This will run the command for the preferred distribution gathered from the website
+    ///
+    /// Note: You will have to confirm the command before it can be ran
+    #[clap(short = 'r', long = "run_install_command", default_value = "false")]
+    run_install_command: bool,
+
+    /// Automatically find the distribution to search for
+    ///
+    /// This will detect your distribution from `/etc/os-release`'s ID or ID_LIKE
+    #[clap(long = "find-preferred-distribution", default_value = "false")]
     find_preferred_distribution: bool,
+
+    /// Verbose
+    ///
+    /// This will show more (mostly debug) logs
+    #[clap(long = "verbose", default_value = "false")]
     verbose: bool,
 }
-impl Default for Settings {
-    /// DEBUG default settings
-    fn default() -> Settings {
-        Settings {
-            run_install_command: false,
-            find_command: false,
-            preferred_distribution: Distribution::All,
-            find_preferred_distribution: true,
-            verbose: true,
-        }
-    }
-}
-impl Display for Settings {
+/// Display (mostly for DEBUG)
+impl Display for Arguments {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
             "\
-            Settings:\n \
+            Arguments:\n \
+            Command: {} \n \
             Run install command: {}\n \
             Find command: {}\n \
             Preferred distribution: {}\n \
             Find preferred distribution: {}\n \
-            Verbose: {}\n \
+            Verbose: {} \
             ",
+            self.command,
             self.run_install_command,
             self.find_command,
-            self.preferred_distribution,
+            self.preferred_distribution.unwrap_or_default(),
             self.find_preferred_distribution,
             self.verbose
         )
@@ -160,20 +202,22 @@ impl Display for Settings {
 
 /***** Information finder *****/
 struct InformationFinder {
-    settings: Settings,
+    arguments: Arguments,
 }
 impl InformationFinder {
     /// Create a new information finder
-    fn new(settings: Settings) -> InformationFinder {
-        InformationFinder { settings: settings }
+    fn new(arguments: Arguments) -> Self {
+        Self {
+            arguments: arguments,
+        }
     }
 
     /// Find the distribution
-    /// If disallowed in settings, it won't auto-detect and instead use the preferred,
+    /// If disallowed in arguments, it won't auto-detect and instead use the preferred,
     /// it's okay to unwrap in this case!
     fn find_distribution(&self) -> Result<Distribution, CommandWasError> {
         // Are we allowed to?
-        if !self.settings.find_preferred_distribution {
+        if !self.arguments.find_preferred_distribution {
             return Err(NotAllowedToAutoFind);
         }
 
@@ -196,7 +240,7 @@ impl InformationFinder {
             )));
         }
 
-        match Distribution::from_str(&distribution) {
+        match <Distribution as FromStr>::from_str(&distribution) {
             Ok(string_distribution) => Ok(string_distribution),
             Err(_) => Err(AutoDetectError(format!(
                 "Distribution detected ({}) is not a valid distribution",
@@ -208,15 +252,13 @@ impl InformationFinder {
 
 /***** Scraper *****/
 struct Scraper {
-    command: String,
-    settings: Settings,
+    arguments: Arguments,
 }
 impl Scraper {
     /// Create a new scraper
-    fn new(command: String, settings: Settings) -> Scraper {
-        Scraper {
-            command: command,
-            settings: settings,
+    fn new(arguments: Arguments) -> Self {
+        Self {
+            arguments: arguments,
         }
     }
 
@@ -243,7 +285,10 @@ impl Scraper {
         };
 
         match client
-            .get(format!("https://command-not-found.com/{}", self.command))
+            .get(format!(
+                "https://command-not-found.com/{}",
+                self.arguments.command
+            ))
             .send()?
             .text()
         {
@@ -256,40 +301,42 @@ impl Scraper {
     }
 }
 
-fn run(settings: Settings) {
+fn run(arguments: Arguments) {
     // Find information
     // Note: If we aren't allowed to find the information, it won't look for it
     // and we can just set it to a fallback
-    let information_finder = InformationFinder::new(settings);
+    let information_finder = InformationFinder::new(arguments.clone());
     let distribution = match information_finder.find_distribution() {
         Ok(distribution) => distribution,
         Err(e) => {
             CommandWasError::log_error("finding distribution", e);
-            settings.preferred_distribution
+            arguments.clone().preferred_distribution.unwrap_or_default()
         }
     };
     debug!("Found distribution: {}", distribution);
 
-    // let scraper = Scraper::new(format!("rust"), settings);
+    // Get the HTML response
+    // let scraper = Scraper::new(arguments);
     // let resp = match scraper.get_html_response() {
-    //     Ok(resp) => resp,
-    //     Err(e) => {
-    //         CommandWasError::log_error("scraper", e);
-    //         return;
-    //     }
+    // Ok(resp) => resp,
+    // Err(e) => {
+    // CommandWasError::log_error("scraper", e);
+    // return;
+    // }
     // };
+    // debug!("Response: {}", resp)
 }
 
 fn main() {
-    // Get settings
-    let settings = Settings::default();
+    // Get arguments
+    let arguments = Arguments::parse();
 
     // Logger
     LoggerBuilder::from_default_env()
         .format_target(true)
         .filter(
             None,
-            match settings.verbose {
+            match arguments.verbose {
                 true => LevelFilter::Debug,
                 false => LevelFilter::Info,
             },
@@ -297,7 +344,7 @@ fn main() {
         .target(Target::Stdout)
         .init();
 
-    debug!("{}", settings);
+    debug!("{}", arguments);
 
-    run(Settings::default());
+    run(arguments);
 }
