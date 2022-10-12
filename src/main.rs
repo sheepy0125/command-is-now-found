@@ -58,7 +58,7 @@ enum CommandWasError {
     /// Will show a hint to run with a flag
     #[error(
         "There's no information for your preferred distribution!\n\
-        Hint: Run with --all-distributions to get all distributions"
+        Hint: Run with `--distribution all` to get all distributions"
     )]
     NoInformationForSelectedDistributionError,
     /// Couldn't auto-detect something
@@ -98,7 +98,7 @@ use CommandWasError::*;
 /// Distribution
 /// There are actually more on the website, however, if they're from the same package
 /// manager there's an almost certain chance they will be the same command
-#[derive(Debug, ArgEnum, Clone, Copy)]
+#[derive(Debug, ArgEnum, Clone, Copy, PartialEq)]
 enum Distribution {
     Arch,
     Debian,
@@ -182,12 +182,12 @@ struct Arguments {
     )]
     should_prepend: bool,
 
-    /// Preferred distribution (if auto-find is disabled)
+    /// Distribution to get (if auto-find is disabled)
     ///
     /// Defaults to all distributions if not given
     #[clap(
         short = 'd',
-        long = "preferred-distribution",
+        long = "distribution",
         possible_values = Distribution::POSSIBLE_VALUES,
         conflicts_with = "find-preferred-distribution",
         ignore_case = true
@@ -358,7 +358,7 @@ impl Display for ParsedResponse {
 }
 
 /// A selector type to get
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum SelectorType {
     Maintainer,            // In the card box
     Homepage,              // In the card box
@@ -433,33 +433,78 @@ impl SelectorType {
             Self::Section => true,
             Self::Description => false,
             Self::Command(_) => panic!(
-                "selector_needs_pure_text_without_tags shouldn't be called for\
+                "selector_needs_pure_text_without_tags shouldn't be called for \
                 the command selector, it should be handled separately!"
             ),
         }
     }
 }
 
-/// Parser
-struct Parser {
+/* Scraper */
+struct Scraper {
     arguments: Arguments,
+    distribution: Distribution,
+    html: String,
     parsed_html: Html,
     parsed_response: Option<ParsedResponse>,
 }
-impl Parser {
-    fn new(arguments: Arguments) -> Parser {
-        Parser {
+impl Scraper {
+    fn new(arguments: Arguments, distribution: Distribution) -> Scraper {
+        Scraper {
             arguments,
+            distribution,
+            html: String::new(),
             parsed_html: Html::new_document(),
             parsed_response: None,
         }
     }
 
+    /// Get the HTML response
+    fn get_html_response(&mut self) -> Result<(), CommandWasError> {
+        // We want to catch redirects, which signify no information
+        let redirected = Arc::new(AtomicBool::new(false));
+        let redirect_policy = {
+            let redirected = redirected.clone();
+            RedirectPolicy::custom(move |attempt| {
+                redirected.store(true, Ordering::Relaxed);
+                attempt.stop()
+            })
+        };
+        // Handle the reqwest error as an unknown error here
+        let client = match Client::builder()
+            .redirect(redirect_policy)
+            .user_agent(APP_USER_AGENT)
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                return Err(UnknownError(format!(
+                    "Could not make request client: {}",
+                    e
+                )));
+            }
+        };
+
+        self.html = match client
+            .get(format!("http://127.0.0.1:8090/{}", self.arguments.command))
+            .send()?
+            .text()
+        {
+            Ok(text) => match redirected.load(Ordering::Relaxed) {
+                false => text,
+                true => return Err(NoInformationError),
+            },
+            Err(e) => return Err(RequestError(format!("{}", e))),
+        };
+
+        Ok(())
+    }
+
     /// Parse everything
-    fn parse(&mut self, html: String) -> Result<(), CommandWasError> {
+    fn parse(&mut self) -> Result<(), CommandWasError> {
         let mut parsed_response = ParsedResponse::default();
 
-        self.parsed_html = match Html::parse_document(&html) {
+        self.parsed_html = match Html::parse_document(&self.html) {
             // Detect if there's an error
             parsed if (parsed.errors.len() > 0) => {
                 return Err(CommandWasError::ParseError(format!(
@@ -477,8 +522,7 @@ impl Parser {
             parsed_response.maintainer = self.get_card_box_selector_wrapper(Maintainer);
             parsed_response.section = self.get_card_box_selector_wrapper(Section);
             parsed_response.commands =
-                self.get_command_selector_wrapper(Command(Distribution::Windows));
-            // DEBUG
+                self.get_command_selector_wrapper(Command(self.distribution));
         }
 
         self.parsed_response = Some(parsed_response);
@@ -620,17 +664,77 @@ impl Parser {
             })
             .collect::<Vec<CommandParsed>>();
 
-        Ok(Some(distributions))
+        match selector_type {
+            SelectorType::Command(distribution) => {
+                use Distribution::*;
+                match distribution {
+                    // If the distribution is all distributions, great!
+                    // We can return what we have
+                    All => Ok(Some(distributions)),
+                    // Otherwise, we have to find the distribution that we need
+                    _ => {
+                        let found = distributions
+                            .iter()
+                            .find(|command_parsed| command_parsed.distribution == distribution);
+
+                        match found {
+                            Some(found) => {
+                                // For some reason, I couldn't use .to_owned() to get an owned
+                                // struct. Take this hacky workaround instead!
+                                let found_owned = CommandParsed {
+                                    distribution: found.distribution,
+                                    install_commands: found.install_commands.clone(),
+                                };
+                                Ok(Some(vec![found_owned]))
+                            }
+                            None => Ok(None),
+                        }
+                    }
+                }
+            }
+            _ => Err(CommandWasError::ParseError(format!(
+                "Didn't get a comnmand selector for handling of a command selector"
+            ))),
+        }
     }
     /// Wrapper for getting a card box selector with error handling
     fn get_command_selector_wrapper(&self, selector: SelectorType) -> Vec<CommandParsed> {
-        match self.get_command_selector(selector) {
+        let log_level = "parsing commands";
+
+        match self.get_command_selector(selector.clone()) {
             Ok(result) => match result {
                 Some(result) => result,
-                None => Vec::new(),
+                None => {
+                    // So, we didn't get the response we needed. Because we know the page
+                    // existed from the redirect handler, this is the selected distribution
+                    // being nonexistent
+
+                    match selector {
+                        // Sanity check (could happen when the scraper breaks)
+                        SelectorType::Command(distribution)
+                            if &distribution == &Distribution::All =>
+                        {
+                            CommandWasError::log_error(
+                                log_level,
+                                CommandWasError::NoInformationError,
+                            );
+                            CommandWasError::log_error(
+                                log_level,
+                                CommandWasError::ParseError(format!(
+                                    "No information even though the page exists. Is the scraper broken?"
+                                )),
+                            );
+                        }
+                        _ => CommandWasError::log_error(
+                            log_level,
+                            CommandWasError::NoInformationForSelectedDistributionError,
+                        ),
+                    };
+                    Vec::new()
+                }
             },
             Err(e) => {
-                CommandWasError::log_error("parsing commands", e);
+                CommandWasError::log_error(log_level, e);
                 Vec::new()
             }
         }
@@ -663,64 +767,6 @@ impl Parser {
     }
 }
 
-/***** Scraper *****/
-struct Scraper {
-    arguments: Arguments,
-    /// Will be set to None when initialized
-    parsed: Option<ParsedResponse>,
-}
-impl Scraper {
-    /// Create a new scraper
-    fn new(arguments: Arguments) -> Self {
-        Self {
-            arguments: arguments,
-            parsed: None,
-        }
-    }
-
-    /// Get the HTML response
-    fn get_html_response(&self) -> Result<String, CommandWasError> {
-        // We want to catch redirects, which signify no information
-        let redirected = Arc::new(AtomicBool::new(false));
-        let redirect_policy = {
-            let redirected = redirected.clone();
-            RedirectPolicy::custom(move |attempt| {
-                redirected.store(true, Ordering::Relaxed);
-                attempt.stop()
-            })
-        };
-        // Handle the reqwest error as an unknown error here
-        let client = match Client::builder()
-            .redirect(redirect_policy)
-            .user_agent(APP_USER_AGENT)
-            .build()
-        {
-            Ok(client) => client,
-            Err(e) => {
-                return Err(UnknownError(format!(
-                    "Could not make request client: {}",
-                    e
-                )));
-            }
-        };
-
-        match client
-            .get(format!(
-                "https://command-not-found.com/{}",
-                self.arguments.command
-            ))
-            .send()?
-            .text()
-        {
-            Ok(text) => match redirected.load(Ordering::Relaxed) {
-                false => Ok(text),
-                true => Err(NoInformationError),
-            },
-            Err(e) => Err(RequestError(format!("{}", e))),
-        }
-    }
-}
-
 // TODO: Don't clone arguments 4 times?
 fn run(arguments: Arguments) {
     // Find information
@@ -736,20 +782,21 @@ fn run(arguments: Arguments) {
     };
     debug!("Found distribution: {}", distribution);
 
+    let mut parser = Scraper::new(arguments.clone(), distribution);
+
     // Get the HTML response
-    let scraper = Scraper::new(arguments.clone());
-    let resp = match scraper.get_html_response() {
-        Ok(resp) => resp,
+    match parser.get_html_response() {
+        Ok(()) => {
+            trace!("Got response: {}", parser.html);
+        }
         Err(e) => {
-            CommandWasError::log_error("scraper", e);
+            CommandWasError::log_error("parser getting HTML response", e);
             return;
         }
     };
-    trace!("Response: {}", resp);
 
     // Parse the HTML response
-    let mut parser = Parser::new(arguments.clone());
-    match parser.parse(resp) {
+    match parser.parse() {
         Ok(_) => {
             debug!("{}", parser.parsed_response.unwrap()) // safe to unwrap, not error'd
         }
@@ -786,15 +833,27 @@ fn main() {
             };
             style.set_bold(true);
 
-            writeln!(
-                buffer,
-                "{}:{} {} [{}] : {}",
-                record.file().unwrap_or("unknown"),
-                record.line().unwrap_or(0),
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                style.value(level),
-                record.args()
-            )
+            // Split the arguments by newline, so we can prepend the text for every line
+            // If an error occurs, it'll only catch the first one, but then it'll stop execution of other writeln!'s
+            for result in (&record).args().to_string().split('\n').map(|line| {
+                match writeln!(
+                    buffer,
+                    "{}:{} {} [{}] : {}",
+                    record.file().unwrap_or("unknown"),
+                    record.line().unwrap_or(0),
+                    Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    style.value(level),
+                    line
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }) {
+                if (&result).is_err() {
+                    return result;
+                }
+            }
+            Ok(())
         })
         .target(Target::Stdout)
         .init();
