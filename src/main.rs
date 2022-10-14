@@ -272,9 +272,7 @@ struct InformationFinder {
 impl InformationFinder {
     /// Create a new information finder
     fn new(arguments: Arguments) -> Self {
-        Self {
-            arguments: arguments,
-        }
+        Self { arguments }
     }
 
     /// Find the distribution
@@ -300,9 +298,9 @@ impl InformationFinder {
         }
         // In any case that that's also nonexistent (still empty!), raise an error
         if (&distribution).is_empty() {
-            return Err(AutoDetectError(format!(
-                "os-release's id and id_like appear to be empty"
-            )));
+            return Err(AutoDetectError(
+                "os-release's id and id_like appear to be empty".to_string(),
+            ));
         }
 
         match <Distribution as FromStr>::from_str(&distribution) {
@@ -348,16 +346,15 @@ impl Display for ParsedResponse {
             \n{description_label}\n{description_value}\
             \n\n{commands_value}",
             maintainer_label = label_style.paint("Maintainer"),
-            maintainer_value = (self.maintainer.clone()).unwrap_or_else(|| format!("<none>")),
+            maintainer_value = (self.maintainer.clone()).unwrap_or_else(|| "<none>".to_string()),
             homepage_label = label_style.paint("Homepage"),
-            homepage_value = (self.homepage.clone()).unwrap_or_else(|| format!("<none>")),
+            homepage_value = (self.homepage.clone()).unwrap_or_else(|| "<none>".to_string()),
             section_label = label_style.paint("Section"),
-            section_value = (self.section.clone()).unwrap_or_else(|| format!("<none>")),
+            section_value = (self.section.clone()).unwrap_or_else(|| "<none>".to_string()),
             description_label = label_style.paint("Description"),
             description_value = (self.description.clone())
-                .unwrap_or_else(|| format!("<none>"))
-                .trim_start() // Sometimes the description will start with `\n`
-                .to_string(), // TODO: should this be handled in the parser? ^
+                .unwrap_or_else(|| "<none>".to_string())
+                .trim_start(), // TODO: should this be handled in the parser? ^
             commands_value = (self
                 .commands
                 .iter()
@@ -428,20 +425,17 @@ impl SelectorType {
                 &Self::str_format_hashmap_helper("nth_child", "3"),
             )
             .unwrap(),
-            Self::Description => format!("{}", Self::DESCRIPTION_SELECTOR),
+            Self::Description => Self::DESCRIPTION_SELECTOR.to_string(),
             Self::Command(distribution) => match distribution {
-                Distribution::All => format!("{}", Self::COMMANDS_SELECTOR),
-                _ => format!(
-                    "{}",
-                    strfmt(
-                        Self::COMMANDS_SELECTOR,
-                        &Self::str_format_hashmap_helper(
-                            "distribution",
-                            distribution.to_string().to_lowercase().as_str()
-                        )
-                    )
-                    .unwrap()
-                ),
+                Distribution::All => Self::COMMANDS_SELECTOR.to_string(),
+                _ => strfmt(
+                    Self::COMMANDS_SELECTOR,
+                    &Self::str_format_hashmap_helper(
+                        "distribution",
+                        distribution.to_string().to_lowercase().as_str(),
+                    ),
+                )
+                .unwrap(),
             },
         }
     }
@@ -531,7 +525,7 @@ impl Scraper {
 
         self.parsed_html = match Html::parse_document(&self.html) {
             // Detect if there's an error
-            parsed if (parsed.errors.len() > 0) => {
+            parsed if !parsed.errors.is_empty() => {
                 return Err(CommandWasError::ParseError(format!(
                     "Error with parsing tree: {}",
                     parsed.errors.join(", ")
@@ -548,7 +542,7 @@ impl Scraper {
             parsed_response.section = self.get_card_box_selector_wrapper(Section);
             parsed_response.commands =
                 match self.get_command_selector_wrapper(Command(self.distribution)) {
-                    commands if (commands.len() == 0) => {
+                    commands if commands.is_empty() => {
                         return Err(CommandWasError::NoInformationForSelectedDistributionError)
                     }
                     commands => commands,
@@ -569,9 +563,9 @@ impl Scraper {
             Ok(optional_element) => match optional_element {
                 Some(parsed_element) => parsed_element,
                 None => {
-                    return Err(CommandWasError::ParseError(format!(
-                        "Couldn't find a card box selector!"
-                    )));
+                    return Err(CommandWasError::ParseError(
+                        "Couldn't find a card box selector!".to_string(),
+                    ));
                 }
             },
             Err(e) => {
@@ -635,7 +629,9 @@ impl Scraper {
         let distributions = Distribution::ALL_DISTRIBUTIONS
             .iter()
             .map(|distribution| <Distribution as FromStr>::from_str(distribution).unwrap())
-            .map(|distribution| {
+            .filter_map(|distribution| {
+                // Attempt to find the command from the HTML
+                // Sometimes, it'll just not be there
                 // Attempt to find the command from the HTML
                 // Sometimes, it'll just not be there
                 let distribution_selector = SelectorType::Command(distribution);
@@ -659,7 +655,7 @@ impl Scraper {
                         text => Some(text),
                     })
                     // Convert to Strings
-                    .map(|text_str| format!("{}", text_str))
+                    .map(|text_str| text_str.to_string())
                     // Prepend to commands
                     .map(|text| {
                         // Should we?
@@ -671,7 +667,7 @@ impl Scraper {
                         // package manager started with any part of `sudo` then it would
                         // get removed)
                         let mut text = match text.strip_prefix("sudo ") {
-                            Some(text) => format!("{}", text),
+                            Some(text) => text.to_string(),
                             None => text.clone(), // the text passed in to the map
                         };
                         // Add the prepend string
@@ -688,13 +684,9 @@ impl Scraper {
                         Some(preferred_distribution) => preferred_distribution == distribution,
                         None => false,
                     }),
-                    distribution: distribution,
-                    install_commands: install_commands,
+                    distribution,
+                    install_commands,
                 })
-            })
-            .filter_map(|optional_command_parsed| match optional_command_parsed {
-                Some(command_parsed) => Some(command_parsed),
-                None => None,
             })
             .collect::<Vec<CommandParsed>>();
 
@@ -727,9 +719,9 @@ impl Scraper {
                     }
                 }
             }
-            _ => Err(CommandWasError::ParseError(format!(
-                "Didn't get a comnmand selector for handling of a command selector"
-            ))),
+            _ => Err(CommandWasError::ParseError(
+                "Didn't get a comnmand selector for handling of a command selector".to_string(),
+            )),
         }
     }
     /// Wrapper for getting a card box selector with error handling
@@ -747,7 +739,7 @@ impl Scraper {
                     match selector {
                         // Sanity check (could happen when the scraper breaks)
                         SelectorType::Command(distribution)
-                            if &distribution == &Distribution::All =>
+                            if distribution == Distribution::All =>
                         {
                             CommandWasError::log_error(
                                 log_level,
@@ -755,9 +747,11 @@ impl Scraper {
                             );
                             CommandWasError::log_error(
                                 log_level,
-                                CommandWasError::ParseError(format!(
-                                    "No information even though the page exists. Is the scraper broken?"
-                                )),
+                                CommandWasError::ParseError(
+                                    "No information even though the page exists. \
+                                    Is the scraper broken?"
+                                        .to_string(),
+                                ),
                             );
                         }
                         _ => (),
@@ -809,7 +803,7 @@ fn run(arguments: Arguments) {
         Ok(distribution) => distribution,
         Err(e) => {
             CommandWasError::log_error("finding distribution", e);
-            (&arguments).preferred_distribution.unwrap_or_default()
+            arguments.preferred_distribution.unwrap_or_default()
         }
     };
     info!("Found distribution: {}", distribution);
@@ -844,7 +838,7 @@ fn run(arguments: Arguments) {
 fn main() {
     // Get arguments
     let arguments = Arguments::parse();
-    let verbose = arguments.verbose.clone(); // Will be moved in the logger format, don't use
+    let verbose = arguments.verbose; // Will be moved in the logger format, don't use
 
     // Logger
     let columns = if let Some((Width(width), Height(_))) = terminal_size() {
@@ -852,7 +846,7 @@ fn main() {
     } else {
         CommandWasError::log_error(
             "getting terminal size",
-            UnknownError(format!("Terminal size width returned None")),
+            UnknownError("Terminal size width returned None".to_string()),
         );
         80
     };
@@ -884,17 +878,14 @@ fn main() {
             // Split the arguments by newline, so we can prepend the text for every line
             // If an error occurs, it'll only catch the first one, but then it'll stop execution
             // of other write!'s
-            for result in (&record).args().to_string().split('\n').map(|line| {
+            for result in record.args().to_string().split('\n').map(|line| {
                 // If verbose mode is deactivated and an info message is sent, then only show that on a
                 // single line and have that line change. However, if the terminal columns is too few,
                 // then do it normally again
-                let single_line_status = match verbose {
-                    false if (
+                let single_line_status = matches!(verbose, false if (
                         record.level() == Level::Info &&
                         columns > MIN_COLUMN_SINGLE_LINE_STATUS
-                    ) => true,
-                    _ => false
-                };
+                    ));
                 match write!(
                     buffer,
                     "{potential_clear}\r{file}:{line} {time} [{log_level}] : {message}{potential_newline}",
@@ -944,5 +935,5 @@ fn main() {
     debug!("{}", arguments);
 
     info!("Running");
-    run(arguments.clone());
+    run(arguments);
 }
