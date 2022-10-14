@@ -333,9 +333,9 @@ impl Display for ParsedResponse {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let label_style = Style::new().fg(AnsiTermColor::White).bold();
         let distribution_label_style = Style::new().fg(AnsiTermColor::Purple);
-        let unperferred_distribution_label_style =
+        let unpreferred_distribution_label_style =
             Style::new().fg(AnsiTermColor::Cyan).dimmed().bold();
-        let perferred_distribution_label_style =
+        let preferred_distribution_label_style =
             Style::new().fg(AnsiTermColor::Cyan).bold().italic();
 
         write!(
@@ -354,7 +354,7 @@ impl Display for ParsedResponse {
             description_label = label_style.paint("Description"),
             description_value = (self.description.clone())
                 .unwrap_or_else(|| "<none>".to_string())
-                .trim_start(), // TODO: should this be handled in the parser? ^
+                .trim_start(),
             commands_value = (self
                 .commands
                 .iter()
@@ -364,9 +364,9 @@ impl Display for ParsedResponse {
                         distribution_label = distribution_label_style.paint("Distribution"),
                         distribution = {
                             match command_info.is_preferred_distribution {
-                                true => perferred_distribution_label_style
+                                true => preferred_distribution_label_style
                                     .paint(command_info.distribution.to_string()),
-                                false => unperferred_distribution_label_style
+                                false => unpreferred_distribution_label_style
                                     .paint(command_info.distribution.to_string()),
                             }
                         },
@@ -680,9 +680,14 @@ impl Scraper {
                     .collect::<Vec<String>>();
 
                 Some(CommandParsed {
-                    is_preferred_distribution: (match self.arguments.preferred_distribution {
-                        Some(preferred_distribution) => preferred_distribution == distribution,
-                        None => false,
+                    is_preferred_distribution: (match self
+                        .arguments
+                        .preferred_distribution
+                        .is_some()
+                        || self.arguments.find_preferred_distribution
+                    {
+                        true => self.distribution == distribution,
+                        false => false,
                     }),
                     distribution,
                     install_commands,
@@ -691,36 +696,9 @@ impl Scraper {
             .collect::<Vec<CommandParsed>>();
 
         match selector_type {
-            SelectorType::Command(distribution) => {
-                use Distribution::*;
-                match distribution {
-                    // If the distribution is all distributions, great!
-                    // We can return what we have
-                    All => Ok(Some(distributions)),
-                    // Otherwise, we have to find the distribution that we need
-                    _ => {
-                        let found = distributions
-                            .iter()
-                            .find(|command_parsed| command_parsed.distribution == distribution);
-
-                        match found {
-                            Some(found) => {
-                                // For some reason, I couldn't use .to_owned() to get an owned
-                                // struct. Take this hacky workaround instead! (please fix XXX)
-                                let found_owned = CommandParsed {
-                                    is_preferred_distribution: found.is_preferred_distribution,
-                                    distribution: found.distribution,
-                                    install_commands: found.install_commands.clone(),
-                                };
-                                Ok(Some(vec![found_owned]))
-                            }
-                            None => Ok(None),
-                        }
-                    }
-                }
-            }
+            SelectorType::Command(_) => Ok(Some(distributions)),
             _ => Err(CommandWasError::ParseError(
-                "Didn't get a comnmand selector for handling of a command selector".to_string(),
+                "Didn't get a command selector for handling of a command selector".to_string(),
             )),
         }
     }
@@ -807,6 +785,7 @@ fn run(arguments: Arguments) {
         }
     };
     info!("Found distribution: {}", distribution);
+    // Update the arguments for the scraper
 
     // Scrape
     let mut scraper = Scraper::new(arguments.clone(), distribution);
@@ -826,10 +805,12 @@ fn run(arguments: Arguments) {
 
     // Parse the HTML response
     info!("Parsing HTML response...");
+    let parsed_response;
     match scraper.parse() {
         Ok(_) => {
+            parsed_response = scraper.parsed_response.unwrap(); // safe to unwrap, not error'd
             info!("Information for {}", arguments.command);
-            println!("\n{}", scraper.parsed_response.unwrap()) // safe to unwrap, not error'd
+            println!("\n{}", parsed_response)
         }
         Err(e) => CommandWasError::log_error("parsing", e),
     }
