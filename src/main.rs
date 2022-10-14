@@ -18,6 +18,8 @@ use std::{
     },
 };
 
+use terminal_size::{terminal_size, Height, Width};
+
 extern crate strfmt;
 use std::collections::HashMap;
 use strfmt::strfmt;
@@ -27,8 +29,9 @@ use os_release::OsRelease;
 
 #[macro_use]
 extern crate log;
+use ansi_term::{Color as AnsiTermColor, Style};
 use chrono::Local;
-use env_logger::{fmt::Color, Builder as LoggerBuilder, Env, Target};
+use env_logger::{fmt::Color as EnvLoggerColor, Builder as LoggerBuilder, Env, Target};
 use log::{Level, LevelFilter};
 
 use clap::{ArgEnum, Parser as ClapParser};
@@ -40,6 +43,7 @@ use reqwest::{blocking::Client, redirect::Policy as RedirectPolicy};
 
 /* Statics */
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+static MIN_COLUMN_SINGLE_LINE_STATUS: u16 = 60;
 
 /* Enums */
 /// Error
@@ -123,9 +127,8 @@ impl Distribution {
     ];
 
     /// Used for iterating
-    const ALL_DISTRIBUTIONS: &'static [&'static str] = &[
-        "arch", "debian", "ubuntu", "fedora", "alpine", "centos", "windows",
-    ];
+    const ALL_DISTRIBUTIONS: &'static [&'static str] =
+        &["arch", "debian", "fedora", "alpine", "centos", "windows"];
 }
 impl FromStr for Distribution {
     type Err = ();
@@ -150,6 +153,8 @@ impl Display for Distribution {
         write!(f, "{:#?}", self)
     }
 }
+
+/* Structs */
 
 /// Arguments
 #[derive(ClapParser, Clone)]
@@ -312,6 +317,7 @@ impl InformationFinder {
 
 /***** Parser *****/
 struct CommandParsed {
+    is_preferred_distribution: bool,
     distribution: Distribution,
     install_commands: Vec<String>,
 }
@@ -327,28 +333,47 @@ struct ParsedResponse {
 /// Display
 impl Display for ParsedResponse {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        let label_style = Style::new().fg(AnsiTermColor::White).bold();
+        let distribution_label_style = Style::new().fg(AnsiTermColor::Purple);
+        let unperferred_distribution_label_style =
+            Style::new().fg(AnsiTermColor::Cyan).dimmed().bold();
+        let perferred_distribution_label_style =
+            Style::new().fg(AnsiTermColor::Cyan).bold().italic();
+
         write!(
             f,
-            "\
-            Maintainer: {}\n\
-            Homepage: {}\n\
-            Section: {}\n\
-            Description: {}\n\
-            ======\n\
-            Commands:\n{}\n\
-            ",
-            (self.maintainer.clone()).unwrap_or_else(|| format!("<none>")),
-            (self.homepage.clone()).unwrap_or_else(|| format!("<none>")),
-            (self.section.clone()).unwrap_or_else(|| format!("<none>")),
-            (self.description.clone()).unwrap_or_else(|| format!("<none>")),
-            (self
+            "{maintainer_label}\n{maintainer_value}\
+            \n{homepage_label}\n{homepage_value}\
+            \n{section_label}\n{section_value}\
+            \n{description_label}\n{description_value}\
+            \n\n{commands_value}",
+            maintainer_label = label_style.paint("Maintainer"),
+            maintainer_value = (self.maintainer.clone()).unwrap_or_else(|| format!("<none>")),
+            homepage_label = label_style.paint("Homepage"),
+            homepage_value = (self.homepage.clone()).unwrap_or_else(|| format!("<none>")),
+            section_label = label_style.paint("Section"),
+            section_value = (self.section.clone()).unwrap_or_else(|| format!("<none>")),
+            description_label = label_style.paint("Description"),
+            description_value = (self.description.clone())
+                .unwrap_or_else(|| format!("<none>"))
+                .trim_start() // Sometimes the description will start with `\n`
+                .to_string(), // TODO: should this be handled in the parser? ^
+            commands_value = (self
                 .commands
                 .iter()
                 .map(|command_info| {
                     format!(
-                        "=== Distribution: {} ===\n{}",
-                        command_info.distribution,
-                        command_info.install_commands.join("\n")
+                        "{distribution_label}: {distribution}\n{commands}",
+                        distribution_label = distribution_label_style.paint("Distribution"),
+                        distribution = {
+                            match command_info.is_preferred_distribution {
+                                true => perferred_distribution_label_style
+                                    .paint(command_info.distribution.to_string()),
+                                false => unperferred_distribution_label_style
+                                    .paint(command_info.distribution.to_string()),
+                            }
+                        },
+                        commands = command_info.install_commands.join("\n")
                     )
                 })
                 .collect::<Vec<String>>())
@@ -486,7 +511,7 @@ impl Scraper {
         };
 
         self.html = match client
-            .get(format!("http://127.0.0.1:8090/{}", self.arguments.command))
+            .get(format!("http://localhost:8090/{}", self.arguments.command))
             .send()?
             .text()
         {
@@ -522,7 +547,12 @@ impl Scraper {
             parsed_response.maintainer = self.get_card_box_selector_wrapper(Maintainer);
             parsed_response.section = self.get_card_box_selector_wrapper(Section);
             parsed_response.commands =
-                self.get_command_selector_wrapper(Command(self.distribution));
+                match self.get_command_selector_wrapper(Command(self.distribution)) {
+                    commands if (commands.len() == 0) => {
+                        return Err(CommandWasError::NoInformationForSelectedDistributionError)
+                    }
+                    commands => commands,
+                }
         }
 
         self.parsed_response = Some(parsed_response);
@@ -654,6 +684,10 @@ impl Scraper {
                     .collect::<Vec<String>>();
 
                 Some(CommandParsed {
+                    is_preferred_distribution: (match self.arguments.preferred_distribution {
+                        Some(preferred_distribution) => preferred_distribution == distribution,
+                        None => false,
+                    }),
                     distribution: distribution,
                     install_commands: install_commands,
                 })
@@ -680,8 +714,9 @@ impl Scraper {
                         match found {
                             Some(found) => {
                                 // For some reason, I couldn't use .to_owned() to get an owned
-                                // struct. Take this hacky workaround instead!
+                                // struct. Take this hacky workaround instead! (please fix XXX)
                                 let found_owned = CommandParsed {
+                                    is_preferred_distribution: found.is_preferred_distribution,
                                     distribution: found.distribution,
                                     install_commands: found.install_commands.clone(),
                                 };
@@ -725,10 +760,7 @@ impl Scraper {
                                 )),
                             );
                         }
-                        _ => CommandWasError::log_error(
-                            log_level,
-                            CommandWasError::NoInformationForSelectedDistributionError,
-                        ),
+                        _ => (),
                     };
                     Vec::new()
                 }
@@ -767,38 +799,43 @@ impl Scraper {
     }
 }
 
-// TODO: Don't clone arguments 4 times?
 fn run(arguments: Arguments) {
     // Find information
     // Note: If we aren't allowed to find the information, it won't look for it
     // and we can just set it to a fallback
+    info!("Finding information...");
     let information_finder = InformationFinder::new(arguments.clone());
     let distribution = match information_finder.find_distribution() {
         Ok(distribution) => distribution,
         Err(e) => {
             CommandWasError::log_error("finding distribution", e);
-            arguments.clone().preferred_distribution.unwrap_or_default()
+            (&arguments).preferred_distribution.unwrap_or_default()
         }
     };
-    debug!("Found distribution: {}", distribution);
+    info!("Found distribution: {}", distribution);
 
-    let mut parser = Scraper::new(arguments.clone(), distribution);
+    // Scrape
+    let mut scraper = Scraper::new(arguments.clone(), distribution);
 
     // Get the HTML response
-    match parser.get_html_response() {
+    info!("Getting HTML response...");
+    match scraper.get_html_response() {
         Ok(()) => {
-            trace!("Got response: {}", parser.html);
+            trace!("Got response: {}", scraper.html);
         }
         Err(e) => {
             CommandWasError::log_error("parser getting HTML response", e);
             return;
         }
     };
+    info!("Got HTML response");
 
     // Parse the HTML response
-    match parser.parse() {
+    info!("Parsing HTML response...");
+    match scraper.parse() {
         Ok(_) => {
-            debug!("{}", parser.parsed_response.unwrap()) // safe to unwrap, not error'd
+            info!("Information for {}", arguments.command);
+            println!("\n{}", scraper.parsed_response.unwrap()) // safe to unwrap, not error'd
         }
         Err(e) => CommandWasError::log_error("parsing", e),
     }
@@ -807,9 +844,20 @@ fn run(arguments: Arguments) {
 fn main() {
     // Get arguments
     let arguments = Arguments::parse();
+    let verbose = arguments.verbose.clone(); // Will be moved in the logger format, don't use
 
     // Logger
-    LoggerBuilder::from_env(Env::new().default_write_style_or("always")) // Assume ANSI compliant terminal
+    let columns = if let Some((Width(width), Height(_))) = terminal_size() {
+        width
+    } else {
+        CommandWasError::log_error(
+            "getting terminal size",
+            UnknownError(format!("Terminal size width returned None")),
+        );
+        80
+    };
+
+    LoggerBuilder::from_env(Env::new().default_write_style_or("always"))
         // Verbose mode for this module if needed
         .filter_module(
             "command_is_now_found_cli",
@@ -821,44 +869,80 @@ fn main() {
         // Don't have verbose on for any other module
         .filter(None, LevelFilter::Info)
         // Formatting
-        .format(|buffer, record| {
+        .format(move |buffer, record| {
             let level = record.level();
             let mut style = buffer.style();
             match record.level() {
-                Level::Error => style.set_color(Color::Red),
-                Level::Info => style.set_color(Color::Green),
-                Level::Warn => style.set_color(Color::Yellow),
-                Level::Debug => style.set_color(Color::Blue),
-                _ => style.set_color(Color::Cyan),
+                Level::Error => style.set_color(EnvLoggerColor::Red),
+                Level::Info => style.set_color(EnvLoggerColor::Green),
+                Level::Warn => style.set_color(EnvLoggerColor::Yellow),
+                Level::Debug => style.set_color(EnvLoggerColor::Blue),
+                _ => style.set_color(EnvLoggerColor::Cyan),
             };
             style.set_bold(true);
 
             // Split the arguments by newline, so we can prepend the text for every line
-            // If an error occurs, it'll only catch the first one, but then it'll stop execution of other writeln!'s
+            // If an error occurs, it'll only catch the first one, but then it'll stop execution
+            // of other write!'s
             for result in (&record).args().to_string().split('\n').map(|line| {
-                match writeln!(
+                // If verbose mode is deactivated and an info message is sent, then only show that on a
+                // single line and have that line change. However, if the terminal columns is too few,
+                // then do it normally again
+                let single_line_status = match verbose {
+                    false if (
+                        record.level() == Level::Info &&
+                        columns > MIN_COLUMN_SINGLE_LINE_STATUS
+                    ) => true,
+                    _ => false
+                };
+                match write!(
                     buffer,
-                    "{}:{} {} [{}] : {}",
-                    record.file().unwrap_or("unknown"),
-                    record.line().unwrap_or(0),
-                    Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    style.value(level),
-                    line
+                    "{potential_clear}\r{file}:{line} {time} [{log_level}] : {message}{potential_newline}",
+                    // Do we need to clear for single status messages?
+                    potential_clear={
+                        match single_line_status {
+                            // Should be \r'd already
+                            true => " ".to_string().repeat(columns.into()),
+                            false => "".to_string(),
+                        }
+                    },
+                    // Should we \r for single-line status messages or \n?
+                    potential_newline = {
+                        match single_line_status {
+                            true => "\r".to_string(),
+                            false => "\n".to_string(),
+                        }
+                    },
+                    file = record.file().unwrap_or("unknown"),
+                    line = record.line().unwrap_or(0),
+                    time = Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    log_level = style.value(level),
+                    message = line
                 ) {
-                    Ok(_) => Ok(()),
+                    Ok(_) => {
+                        buffer.flush()?;
+                        Ok(())
+                    },
                     Err(e) => Err(e),
                 }
             }) {
-                if (&result).is_err() {
-                    return result;
-                }
+                result?
             }
             Ok(())
         })
-        .target(Target::Stdout)
+        .target(Target::Stderr) // for removing of status message with 2>/dev/null
         .init();
+
+    debug!(
+        "Number of columns: {}, exceeds minimum for single line statussing \
+        (not in verbose) {}: {}",
+        columns,
+        MIN_COLUMN_SINGLE_LINE_STATUS,
+        (columns > MIN_COLUMN_SINGLE_LINE_STATUS)
+    );
 
     debug!("{}", arguments);
 
-    run(arguments);
+    info!("Running");
+    run(arguments.clone());
 }
