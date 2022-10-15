@@ -86,9 +86,8 @@ impl From<reqwest::Error> for CommandWasError {
 }
 /// Log errors
 impl CommandWasError {
-    /// TODO: Refactor to use self instead of e
-    fn log_error(target: &str, e: CommandWasError) {
-        error!(target: target.to_lowercase().replace(' ', "_").as_str(), "{}", e);
+    fn log_error(&self, target: &str) {
+        error!(target: target.to_lowercase().replace(' ', "_").as_str(), "{}", self);
     }
 }
 
@@ -268,7 +267,7 @@ impl InformationFinder {
         Self {}
     }
 
-    /// Find the distribution
+    /// Find the distribution automatically
     fn find_distribution(&self) -> Result<Distribution, CommandWasError> {
         // We can find it from os-release's ID
         // See https://www.freedesktop.org/software/systemd/man/os-release.html
@@ -600,7 +599,7 @@ impl Scraper {
         match self.get_card_box_selector(selector) {
             Ok(result) => result,
             Err(e) => {
-                CommandWasError::log_error("parsing card box", e);
+                e.log_error("parsing card box");
                 None
             }
         }
@@ -705,18 +704,13 @@ impl Scraper {
                         SelectorType::Command(distribution)
                             if distribution == Distribution::All =>
                         {
-                            CommandWasError::log_error(
-                                log_level,
-                                CommandWasError::NoInformationError,
-                            );
-                            CommandWasError::log_error(
-                                log_level,
-                                CommandWasError::ParseError(
-                                    "No information even though the page exists. \
-                                    Is the scraper broken?"
-                                        .to_string(),
-                                ),
-                            );
+                            CommandWasError::NoInformationError.log_error(log_level);
+                            ParseError(
+                                "No information even though the page exists. \
+                                Is the scraper broken?"
+                                    .to_string(),
+                            )
+                            .log_error(log_level);
                         }
                         _ => (),
                     };
@@ -724,7 +718,7 @@ impl Scraper {
                 }
             },
             Err(e) => {
-                CommandWasError::log_error(log_level, e);
+                e.log_error(log_level);
                 Vec::new()
             }
         }
@@ -819,6 +813,7 @@ impl CommandRunner {
 
     /// Ask for a preferred distribution
     /// Will return None if the user declines
+    /// Note: this is not in InformationFinder as it has specific stuff relating to validation
     fn ask_preferred_distribution(&self) -> Option<Distribution> {
         let sentinel_none = "none";
         let mut acceptable_answers = Vec::from(Distribution::ALL_DISTRIBUTIONS);
@@ -848,12 +843,8 @@ impl CommandRunner {
                 // safe to unwrap, it's acceptable
             }
             _ => {
-                CommandWasError::log_error(
-                    "asking preferred distribution",
-                    UnknownError(
-                        "The distribution question response was not a response".to_string(),
-                    ),
-                );
+                UnknownError("The distribution question response was not a response".to_string())
+                    .log_error("asking preferred distribution");
                 None
             }
         }
@@ -881,9 +872,8 @@ impl CommandRunner {
             Answer::YES => true,
             Answer::NO => false,
             _ => {
-                CommandWasError::log_error(
-                    "asking should run command",
-                    UnknownError("Value for question was not yes nor no, assuming no".to_string())
+                UnknownError("Value for question was not yes nor no, assuming no".to_string()).log_error(
+                    "asking should run command"
                 );
                 false
             }
@@ -915,7 +905,7 @@ fn run(arguments: Arguments) -> Result<(), ()> {
         true => match information_finder.find_distribution() {
             Ok(distribution) => distribution,
             Err(e) => {
-                CommandWasError::log_error("finding distribution", e);
+                e.log_error("finding distribution");
                 arguments.preferred_distribution.unwrap_or_default()
             }
         },
@@ -933,7 +923,7 @@ fn run(arguments: Arguments) -> Result<(), ()> {
             trace!("Got response: {}", scraper.html);
         }
         Err(e) => {
-            CommandWasError::log_error("parser getting HTML response", e);
+            e.log_error("parser getting HTML response");
             return Err(());
         }
     };
@@ -946,7 +936,7 @@ fn run(arguments: Arguments) -> Result<(), ()> {
             scraper.parsed_response.unwrap() // safe to unwrap, not error'd
         }
         Err(e) => {
-            CommandWasError::log_error("parsing", e);
+            e.log_error("parsing");
             return Err(());
         }
     };
@@ -964,7 +954,7 @@ fn run(arguments: Arguments) -> Result<(), ()> {
                 command_runner.commands = Some(install_commands);
             }
             Err(e) => {
-                CommandWasError::log_error("getting install command", e);
+                e.log_error("getting install command");
                 return Err(());
             }
         }
@@ -974,7 +964,7 @@ fn run(arguments: Arguments) -> Result<(), ()> {
         match command_runner.run_install_command() {
             Ok(()) => (),
             Err(e) => {
-                CommandWasError::log_error("running install command", e);
+                e.log_error("running install command");
                 return Err(());
             }
         }
@@ -992,10 +982,8 @@ fn main() {
     let columns = if let Some((Width(width), Height(_))) = terminal_size() {
         width
     } else {
-        CommandWasError::log_error(
-            "getting terminal size",
-            UnknownError("Terminal size width returned None".to_string()),
-        );
+        UnknownError("Terminal size width returned None".to_string())
+            .log_error("getting terminal size");
         80
     };
 
@@ -1077,7 +1065,8 @@ fn main() {
             }
             Ok(())
         })
-        .target(Target::Stderr) // for removing of status message with 2>/dev/null
+        .target(Target::Stderr) /* for removing of status message with 2>/dev/null
+         *                                       as the output gets sent to stdout */
         .init();
 
     debug!(
