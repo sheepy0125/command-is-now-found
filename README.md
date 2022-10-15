@@ -13,7 +13,7 @@ A simple-but-powerful tool to scrape [command-not-found.com](https://command-not
 
 - [ ] Can read the last entry of `.zsh_history` and `.bash_history` and auto-search (opt-in)
 
-- [ ] Can auto-install (opt-in)
+- [x] Can auto-install (opt-in)
 
 ## Installation
 

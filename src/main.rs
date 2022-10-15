@@ -11,6 +11,7 @@ use thiserror::Error;
 use std::{
     fmt::{Display, Formatter},
     io::Write,
+    process::{Command, Stdio},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -19,6 +20,8 @@ use std::{
 };
 
 use terminal_size::{terminal_size, Height, Width};
+
+use question::{Answer, Question};
 
 extern crate strfmt;
 use std::collections::HashMap;
@@ -44,56 +47,48 @@ use reqwest::{blocking::Client, redirect::Policy as RedirectPolicy};
 /* Statics */
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 static MIN_COLUMN_SINGLE_LINE_STATUS: u16 = 60;
+static DEFAULT_ANSWER_YES_FOR_RUNNING_COMMAND: bool = false;
+
+/* Type aliases */
+type InstallCommands = Vec<String>;
 
 /* Enums */
 /// Error
 #[derive(Error, Debug, PartialEq)]
 enum CommandWasError {
-    /// Request error
+    /// Any request error
     #[error("There was an error with requesting: {0}")]
     RequestError(String),
-    /// Any kind of parse error
+    /// Any parse error
     #[error("There was an error with parsing: {0}")]
     ParseError(String),
     /// No information (redirected to homepage)
     #[error("There's no information for how to install that!")]
     NoInformationError,
     /// No information for the preferred distribution
-    /// Will show a hint to run with a flag
-    #[error(
-        "There's no information for your preferred distribution!\n\
-        Hint: Run with `--distribution all` to get all distributions"
-    )]
+    #[error("There's no information for your preferred distribution!")]
     NoInformationForSelectedDistributionError,
     /// Couldn't auto-detect something
     #[error("Couldn't auto-detect: {0}")]
     AutoDetectError(String),
-    /// Was not allowed to auto-detect something
-    #[error("Wasn't allowed to auto detect")]
-    NotAllowedToAutoFind,
+    /// Any error with running the command
+    #[error("Failed to auto run command: {0}")]
+    AutoRunErrorCommand(String),
     /// Unknown error
     #[error("What? An unknown error occurred, sorry(!): {0}")]
     UnknownError(String),
 }
 /// Implicitly convert reqwest errors
 impl From<reqwest::Error> for CommandWasError {
-    fn from(e: reqwest::Error) -> CommandWasError {
+    fn from(e: reqwest::Error) -> Self {
         CommandWasError::RequestError(format!("{}", e))
     }
 }
 /// Log errors
 impl CommandWasError {
-    /// Errors to not log (in verbose mode they get logged)
-    const NO_LOG_ERRORS: [CommandWasError; 1] = [CommandWasError::NotAllowedToAutoFind];
-
-    /// Won't log errors that shouldn't be logged (in NO_LOG_ERRORS)
-    fn log_error(level: &str, e: CommandWasError) {
-        if !CommandWasError::NO_LOG_ERRORS.contains(&e) {
-            error!(target: level, "{}", e);
-            return;
-        }
-        // Not supposed to log, but the verbose users get special treatment
-        debug!(target: level, "{}", e);
+    /// TODO: Refactor to use self instead of e
+    fn log_error(target: &str, e: CommandWasError) {
+        error!(target: target.to_lowercase().replace(' ', "_").as_str(), "{}", e);
     }
 }
 
@@ -266,24 +261,15 @@ impl Display for Arguments {
 }
 
 /***** Information finder *****/
-struct InformationFinder {
-    arguments: Arguments,
-}
+struct InformationFinder;
 impl InformationFinder {
     /// Create a new information finder
-    fn new(arguments: Arguments) -> Self {
-        Self { arguments }
+    fn new() -> Self {
+        Self {}
     }
 
     /// Find the distribution
-    /// If disallowed in arguments, it won't auto-detect and instead use the preferred,
-    /// it's okay to unwrap in this case!
     fn find_distribution(&self) -> Result<Distribution, CommandWasError> {
-        // Are we allowed to?
-        if !self.arguments.find_preferred_distribution {
-            return Err(NotAllowedToAutoFind);
-        }
-
         // We can find it from os-release's ID
         // See https://www.freedesktop.org/software/systemd/man/os-release.html
         let release = match OsRelease::new() {
@@ -317,7 +303,7 @@ impl InformationFinder {
 struct CommandParsed {
     is_preferred_distribution: bool,
     distribution: Distribution,
-    install_commands: Vec<String>,
+    install_commands: InstallCommands,
 }
 
 #[derive(Default)]
@@ -468,8 +454,8 @@ struct Scraper {
     parsed_response: Option<ParsedResponse>,
 }
 impl Scraper {
-    fn new(arguments: Arguments, distribution: Distribution) -> Scraper {
-        Scraper {
+    fn new(arguments: Arguments, distribution: Distribution) -> Self {
+        Self {
             arguments,
             distribution,
             html: String::new(),
@@ -677,7 +663,7 @@ impl Scraper {
                         );
                         text
                     })
-                    .collect::<Vec<String>>();
+                    .collect::<InstallCommands>();
 
                 Some(CommandParsed {
                     is_preferred_distribution: (match self
@@ -771,23 +757,173 @@ impl Scraper {
     }
 }
 
-fn run(arguments: Arguments) {
-    // Find information
-    // Note: If we aren't allowed to find the information, it won't look for it
-    // and we can just set it to a fallback
-    info!("Finding information...");
-    let information_finder = InformationFinder::new(arguments.clone());
-    let distribution = match information_finder.find_distribution() {
-        Ok(distribution) => distribution,
-        Err(e) => {
-            CommandWasError::log_error("finding distribution", e);
-            arguments.preferred_distribution.unwrap_or_default()
+/* Command runner */
+struct CommandRunner {
+    parsed_response: ParsedResponse,
+    commands: Option<InstallCommands>,
+    command_string: Option<String>,
+}
+impl CommandRunner {
+    fn new(parsed_response: ParsedResponse) -> Self {
+        Self {
+            parsed_response,
+            command_string: None,
+            commands: None,
         }
+    }
+
+    /// Get the install command from the parsed response from the preferred distribution
+    /// If there is no preferred distribution, then it will ask for one
+    fn get_install_command(
+        &self,
+        preferred_distribution: Option<Distribution>,
+    ) -> Result<InstallCommands, CommandWasError> {
+        match self.parsed_response.commands.iter().find(|command_parsed| {
+            match preferred_distribution {
+                Some(preferred_distribution) => {
+                    command_parsed.distribution == preferred_distribution
+                }
+                None => command_parsed.is_preferred_distribution,
+            }
+        }) {
+            Some(command) => Ok(command.install_commands.clone()),
+            None => {
+                // Do the same thing, but ask the user what distribution to use
+                let preferred_distribution = match self.ask_preferred_distribution() {
+                    Some(distribution) => {
+                        // Ensure the distribution is valid and in the response
+                        match self
+                            .parsed_response
+                            .commands
+                            .iter()
+                            .find(|command_parsed| command_parsed.distribution == distribution)
+                        {
+                            Some(_) => distribution,
+                            None => {
+                                return Err(
+                                    CommandWasError::NoInformationForSelectedDistributionError,
+                                )
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(CommandWasError::AutoRunErrorCommand(
+                            "User did not give a preferred distribution".to_string(),
+                        ))
+                    }
+                };
+                self.get_install_command(Some(preferred_distribution))
+            }
+        }
+    }
+
+    /// Ask for a preferred distribution
+    /// Will return None if the user declines
+    fn ask_preferred_distribution(&self) -> Option<Distribution> {
+        let sentinel_none = "none";
+        let mut acceptable_answers = Vec::from(Distribution::ALL_DISTRIBUTIONS);
+        acceptable_answers.push(sentinel_none);
+        match Question::new(
+            format!(
+                "What distribution would you like to run the install command for? \
+                Say \"{}\" to cancel:",
+                sentinel_none
+            )
+            .as_str(),
+        )
+        .acceptable(acceptable_answers.clone())
+        .clarification(
+            format!(
+                "That's not a possible distribution! Valid values: {}\n",
+                acceptable_answers.join(", ")
+            )
+            .as_str(),
+        )
+        .until_acceptable()
+        .ask()
+        {
+            Some(Answer::RESPONSE(none)) if none == sentinel_none => None,
+            Some(Answer::RESPONSE(distribution)) => {
+                Some(<Distribution as FromStr>::from_str(distribution.as_str()).unwrap())
+                // safe to unwrap, it's acceptable
+            }
+            _ => {
+                CommandWasError::log_error(
+                    "asking preferred distribution",
+                    UnknownError(
+                        "The distribution question response was not a response".to_string(),
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    fn ask_should_run_command(&self) -> bool {
+        match Question::new(
+            format!(
+                "Would you like to run the install command:\n{}",
+                self.command_string.as_ref().unwrap() // Safe to unwrap, it's already been populated
+            )
+            .as_str(),
+        )
+        .yes_no()
+        .until_acceptable()
+        .default(match DEFAULT_ANSWER_YES_FOR_RUNNING_COMMAND {
+            true => Answer::YES,
+            false => Answer::NO,
+        })
+        .show_defaults()
+        .clarification("Please either enter \"yes\" or \"no\"!\n")
+        .ask()
+        .unwrap() // Safe to unwrap, it'll keep asking and never be None
+        {
+            Answer::YES => true,
+            Answer::NO => false,
+            _ => {
+                CommandWasError::log_error(
+                    "asking should run command",
+                    UnknownError("Value for question was not yes nor no, assuming no".to_string())
+                );
+                false
+            }
+        }
+    }
+
+    fn run_install_command(&self) -> Result<(), CommandWasError> {
+        match Command::new("sh")
+            .arg("-c")
+            .arg(self.command_string.as_ref().unwrap().as_str()) // safe to unwrap, not called when None
+            .stdout(Stdio::inherit())
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(AutoRunErrorCommand(e.to_string())),
+        }
+    }
+}
+
+fn run(arguments: Arguments) -> Result<(), ()> {
+    /* Find information */
+    let information_finder = InformationFinder::new();
+
+    // Find distribution
+    info!("Finding distribution...");
+    let distribution = match arguments.find_preferred_distribution {
+        true => match information_finder.find_distribution() {
+            Ok(distribution) => distribution,
+            Err(e) => {
+                CommandWasError::log_error("finding distribution", e);
+                arguments.preferred_distribution.unwrap_or_default()
+            }
+        },
+        false => arguments.preferred_distribution.unwrap_or_default(),
     };
     info!("Found distribution: {}", distribution);
-    // Update the arguments for the scraper
 
-    // Scrape
+    /* Scraper */
     let mut scraper = Scraper::new(arguments.clone(), distribution);
 
     // Get the HTML response
@@ -798,22 +934,53 @@ fn run(arguments: Arguments) {
         }
         Err(e) => {
             CommandWasError::log_error("parser getting HTML response", e);
-            return;
+            return Err(());
         }
     };
     info!("Got HTML response");
 
     // Parse the HTML response
     info!("Parsing HTML response...");
-    let parsed_response;
-    match scraper.parse() {
+    let parsed_response = match scraper.parse() {
         Ok(_) => {
-            parsed_response = scraper.parsed_response.unwrap(); // safe to unwrap, not error'd
-            info!("Information for {}", arguments.command);
-            println!("\n{}", parsed_response)
+            scraper.parsed_response.unwrap() // safe to unwrap, not error'd
         }
-        Err(e) => CommandWasError::log_error("parsing", e),
+        Err(e) => {
+            CommandWasError::log_error("parsing", e);
+            return Err(());
+        }
+    };
+    info!("Information for {}", arguments.command);
+    print!("\n{}\n", parsed_response);
+
+    // Run the install commands
+    if arguments.run_install_command {
+        // We're allowed to, so let's do it
+        let mut command_runner = CommandRunner::new(parsed_response);
+        println!();
+        match command_runner.get_install_command(None) {
+            Ok(install_commands) => {
+                command_runner.command_string = Some(install_commands.join("; "));
+                command_runner.commands = Some(install_commands);
+            }
+            Err(e) => {
+                CommandWasError::log_error("getting install command", e);
+                return Err(());
+            }
+        }
+        if !command_runner.ask_should_run_command() {
+            return Ok(());
+        }
+        match command_runner.run_install_command() {
+            Ok(()) => (),
+            Err(e) => {
+                CommandWasError::log_error("running install command", e);
+                return Err(());
+            }
+        }
     }
+
+    Ok(())
 }
 
 fn main() {
@@ -864,14 +1031,17 @@ fn main() {
                 // single line and have that line change. However, if the terminal columns is too few,
                 // then do it normally again
                 let single_line_status = matches!(verbose, false if (
-                        record.level() == Level::Info &&
-                        columns > MIN_COLUMN_SINGLE_LINE_STATUS
-                    ));
+                    record.level() == Level::Info &&
+                    columns > MIN_COLUMN_SINGLE_LINE_STATUS
+                ));
                 match write!(
                     buffer,
-                    "{potential_clear}\r{file}:{line} {time} [{log_level}] : {message}{potential_newline}",
+                    "{potential_clear}\r{file}:{line} {time} : \
+                    {log_level}{log_level_potential_padding} : \
+                    {target} : \
+                    {message}{potential_newline}",
                     // Do we need to clear for single status messages?
-                    potential_clear={
+                    potential_clear = {
                         match single_line_status {
                             // Should be \r'd already
                             true => " ".to_string().repeat(columns.into()),
@@ -886,15 +1056,20 @@ fn main() {
                         }
                     },
                     file = record.file().unwrap_or("unknown"),
-                    line = record.line().unwrap_or(0),
+                    line = format_args!("{:0>4}", record.line().unwrap_or(0)),
                     time = Local::now().format("%Y-%m-%d %H:%M:%S"),
                     log_level = style.value(level),
+                    log_level_potential_padding = match level {
+                        Level::Info => " ",
+                        _ => "",
+                    },
+                    target = record.target(),
                     message = line
                 ) {
                     Ok(_) => {
                         buffer.flush()?;
                         Ok(())
-                    },
+                    }
                     Err(e) => Err(e),
                 }
             }) {
@@ -916,5 +1091,10 @@ fn main() {
     debug!("{}", arguments);
 
     info!("Running");
-    run(arguments);
+    match run(arguments) {
+        Ok(()) => (),
+        Err(()) => {
+            error!("Fatal error, exiting!")
+        }
+    };
 }
