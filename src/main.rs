@@ -9,8 +9,8 @@
 use thiserror::Error;
 
 use std::{
-    fmt::{Display, Formatter},
-    io::Write,
+    fmt::{Display, Formatter as StdFormatter},
+    io::{stdout, Write},
     process::{Command, Stdio},
     str::FromStr,
     sync::{
@@ -19,6 +19,7 @@ use std::{
     },
 };
 
+use crossterm::{cursor, execute};
 use terminal_size::{terminal_size, Height, Width};
 
 use question::{Answer, Question};
@@ -34,8 +35,11 @@ use os_release::OsRelease;
 extern crate log;
 use ansi_term::{Color as AnsiTermColor, Style};
 use chrono::Local;
-use env_logger::{fmt::Color as EnvLoggerColor, Builder as LoggerBuilder, Env, Target};
-use log::{Level, LevelFilter};
+use env_logger::{
+    fmt::{Color as EnvLoggerColor, Formatter as EnvLoggerFormatter},
+    Builder as LoggerBuilder, Env, Target,
+};
+use log::{Level, LevelFilter, Record};
 
 use clap::{ArgEnum, Parser as ClapParser};
 
@@ -146,12 +150,159 @@ impl FromStr for Distribution {
     }
 }
 impl Display for Distribution {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut StdFormatter) -> std::fmt::Result {
         write!(f, "{:#?}", self)
     }
 }
 
 /* Structs */
+
+/// Logger handler
+#[derive(Clone)]
+struct Logger {
+    verbose: bool,
+    columns: u16,
+    starting_y_pos: u16,
+}
+
+impl Logger {
+    fn new(verbose: bool) -> Self {
+        Self {
+            verbose,
+            columns: Self::get_columns(),
+            starting_y_pos: Self::get_cursor_y_pos() - 1,
+        }
+    }
+
+    fn get_columns() -> u16 {
+        if let Some((Width(width), Height(_))) = terminal_size() {
+            width
+        } else {
+            UnknownError("Terminal size width returned None, assuming 80".to_string())
+                .log_error("getting terminal size");
+            80
+        }
+    }
+
+    fn get_cursor_y_pos() -> u16 {
+        if let Ok((_, y)) = cursor::position() {
+            y
+        } else {
+            UnknownError("Failed to get the current position of the cursor".to_string())
+                .log_error("getting cursor y pos");
+            0
+        }
+    }
+
+    fn clear_line(&self) -> String {
+        format!("\r{}", " ".to_string().repeat(self.columns.into()))
+    }
+
+    fn go_back_to_log_single_line(&self) {
+        let log_level = "going back to log single line area";
+
+        // Should we?
+        if self.verbose {
+            // We shalln't!
+            return;
+        }
+
+        let mut cursor_y_pos = Self::get_cursor_y_pos();
+
+        // Clear lines and move up
+        while cursor_y_pos > self.starting_y_pos {
+            cursor_y_pos -= 1;
+            print!("{}", self.clear_line());
+            match execute!(stdout(), cursor::MoveUp(1)) {
+                Ok(()) => (),
+                Err(e) => {
+                    GeneralError(format!("Failed to move cursor up: {}", e)).log_error(log_level)
+                }
+            }
+        }
+
+        // Sanity check
+        cursor_y_pos = Self::get_cursor_y_pos();
+        if cursor_y_pos != self.starting_y_pos {
+            UnknownError(format!(
+                "Moved cursor up, but cursor was not moved up ({} != {})",
+                cursor_y_pos, self.starting_y_pos
+            ))
+            .log_error(log_level);
+        }
+    }
+
+    fn format_write(
+        &self,
+        buffer: &mut EnvLoggerFormatter,
+        record: &Record,
+    ) -> std::io::Result<()> {
+        let level = record.level();
+        let mut style = buffer.style();
+        match record.level() {
+            Level::Error => style.set_color(EnvLoggerColor::Red),
+            Level::Info => style.set_color(EnvLoggerColor::Green),
+            Level::Warn => style.set_color(EnvLoggerColor::Yellow),
+            Level::Debug => style.set_color(EnvLoggerColor::Blue),
+            _ => style.set_color(EnvLoggerColor::Cyan),
+        };
+        style.set_bold(true);
+
+        // Split the arguments by newline, so we can prepend the text for every line
+        // If an error occurs, it'll only catch the first one, but then it'll stop execution
+        // of other write!'s
+        for result in record.args().to_string().split('\n').map(|line| {
+            // If verbose mode is deactivated and an info message is sent, then only show that on a
+            // single line and have that line change. However, if the terminal columns is too few,
+            // then do it normally again
+            let single_line_status = matches!(self.verbose, false if (
+                record.level() == Level::Info &&
+                self.columns > MIN_COLUMN_SINGLE_LINE_STATUS
+            ));
+            match write!(
+                buffer,
+                "{potential_clear}\r{file}:{line} {time} : \
+                    {log_level}{log_level_potential_padding} : \
+                    {target} : \
+                    {message}{potential_newline}",
+                // Do we need to clear for single status messages?
+                potential_clear = {
+                    match single_line_status {
+                        // Should be \r'd already
+                        true => " ".to_string().repeat(self.columns.into()),
+                        false => "".to_string(),
+                    }
+                },
+                // Should we \r for single-line status messages or \n?
+                potential_newline = {
+                    match single_line_status {
+                        true => "\r".to_string(),
+                        false => "\n".to_string(),
+                    }
+                },
+                file = record.file().unwrap_or("unknown"),
+                line = format_args!("{:0>4}", record.line().unwrap_or(0)),
+                time = Local::now().format("%Y-%m-%d %H:%M:%S"),
+                log_level = style.value(level),
+                log_level_potential_padding = match level {
+                    Level::Info => " ",
+                    _ => "",
+                },
+                target = record.target(),
+                message = line
+            ) {
+                Ok(_) => {
+                    buffer.flush()?;
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }) {
+            result?
+        }
+        Ok(())
+    }
+}
 
 /// Arguments
 #[derive(ClapParser, Clone)]
@@ -237,7 +388,7 @@ struct Arguments {
 }
 /// Display (mostly for DEBUG)
 impl Display for Arguments {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut StdFormatter) -> std::fmt::Result {
         write!(
             f,
             "\
@@ -259,16 +410,15 @@ impl Display for Arguments {
     }
 }
 
-/***** Information finder *****/
+/// Information finder
 struct InformationFinder;
 impl InformationFinder {
-    /// Create a new information finder
     fn new() -> Self {
         Self {}
     }
 
     /// Find the distribution automatically
-    fn find_distribution(&self) -> Result<Distribution, CommandWasError> {
+    fn find_distribution_automatically(&self) -> Result<Distribution, CommandWasError> {
         // We can find it from os-release's ID
         // See https://www.freedesktop.org/software/systemd/man/os-release.html
         let release = match OsRelease::new() {
@@ -297,7 +447,8 @@ impl InformationFinder {
         }
     }
 
-    /// Ask the user for the command. Will re-ask until a valid response is given
+    /// Ask the user for a command
+    /// If the user doesn't give a command, it'll keep asking
     fn ask_command(&self) -> String {
         let log_level = "asking user for command";
 
@@ -329,7 +480,7 @@ struct ParsedResponse {
 }
 /// Display
 impl Display for ParsedResponse {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut StdFormatter) -> std::fmt::Result {
         let label_style = Style::new().fg(AnsiTermColor::White).bold();
         let distribution_label_style = Style::new().fg(AnsiTermColor::Purple);
         let unpreferred_distribution_label_style =
@@ -397,13 +548,14 @@ impl SelectorType {
     /// Command selectors (we can't use the data-os attribute since it's not for all distributions)
     const COMMANDS_SELECTOR: &'static str = ".command-install.install-{distribution}>dd";
 
+    /// Helper for formatting str's that returns a hashmap to pass into strfmt
     fn str_format_hashmap_helper(key: &str, value: &str) -> HashMap<String, String> {
         let mut hashmap = HashMap::new();
         hashmap.insert(key.to_string(), value.to_string());
         hashmap
     }
 
-    /// Get a string selector from an enum type
+    /// Turn a selector enum into a String
     fn get_selector(&self) -> String {
         match self {
             Self::Maintainer => strfmt(
@@ -478,6 +630,8 @@ impl Scraper {
     }
 
     /// Get the HTML response
+    /// This won't return a String with the response, but will put it in an instance variable
+    /// (self.html)
     fn get_html_response(&mut self) -> Result<(), CommandWasError> {
         // We want to catch redirects, which signify no information
         let redirected = Arc::new(AtomicBool::new(false));
@@ -518,7 +672,9 @@ impl Scraper {
         Ok(())
     }
 
-    /// Parse everything
+    /// Parse the HTML response
+    /// This won't return anything, but will change instance variables
+    /// (self.parsed_html and self.parsed_response)
     fn parse(&mut self) -> Result<(), CommandWasError> {
         let mut parsed_response = ParsedResponse::default();
 
@@ -553,7 +709,6 @@ impl Scraper {
         Ok(())
     }
 
-    /// Get card box selector
     fn get_card_box_selector(
         &self,
         selector_type: SelectorType,
@@ -608,7 +763,8 @@ impl Scraper {
             )))
         }
     }
-    /// Wrapper for getting a card box selector with error handling
+    /// Wrapper for getting a card box selector
+    /// Will return None if there's an error after logging the error
     fn get_card_box_selector_wrapper(&self, selector: SelectorType) -> Option<String> {
         match self.get_card_box_selector(selector) {
             Ok(result) => result,
@@ -619,7 +775,6 @@ impl Scraper {
         }
     }
 
-    /// Get command selector
     fn get_command_selector(
         &self,
         selector_type: SelectorType,
@@ -702,7 +857,8 @@ impl Scraper {
             )),
         }
     }
-    /// Wrapper for getting a card box selector with error handling
+    /// Wrapper for parsing commands
+    /// Will return an empty Vec if there's an error after logging the error
     fn get_command_selector_wrapper(&self, selector: SelectorType) -> Vec<CommandParsed> {
         let log_level = "parsing commands";
 
@@ -865,6 +1021,8 @@ impl CommandRunner {
         }
     }
 
+    /// Ask if the user should run an install command
+    /// This will keep asking until the user gives a valid response
     fn ask_should_run_command(&self) -> bool {
         match Question::new(
             format!(
@@ -895,6 +1053,8 @@ impl CommandRunner {
         }
     }
 
+    /// Run an install command without blocking
+    /// This will return an error if the command couldn't be ran
     fn run_install_command(&self) -> Result<(), CommandWasError> {
         match Command::new("sh")
             .arg("-c")
@@ -910,207 +1070,154 @@ impl CommandRunner {
     }
 }
 
-fn run(arguments: &mut Arguments) -> Result<(), ()> {
-    let mut arguments = arguments.clone();
+/// Main logic
+struct Main {
+    arguments: Arguments,
+    logger: Logger,
+}
+impl Main {
+    fn new() -> Self {
+        let arguments = Arguments::parse();
+        let logger = Logger::new(arguments.verbose);
 
-    /* Find information */
-    let information_finder = InformationFinder::new();
-
-    // Find command
-    info!("Finding command...");
-    let command = match arguments.command.is_empty() {
-        true => {
-            println!();
-            let command = information_finder.ask_command();
-            arguments.command.push_str(command.as_str());
-            command
-        }
-        false => arguments.command.clone(),
-    };
-    info!("Found command: {}", command);
-
-    // Find distribution
-    info!("Finding distribution...");
-    let distribution = match arguments.find_preferred_distribution {
-        true => match information_finder.find_distribution() {
-            Ok(distribution) => distribution,
-            Err(e) => {
-                e.log_error("finding distribution");
-                arguments.preferred_distribution.unwrap_or_default()
-            }
-        },
-        false => arguments.preferred_distribution.unwrap_or_default(),
-    };
-    info!("Found distribution: {}", distribution);
-
-    /* Scraper */
-    let mut scraper = Scraper::new(arguments.clone(), distribution);
-
-    // Get the HTML response
-    info!("Getting HTML response...");
-    match scraper.get_html_response() {
-        Ok(()) => {
-            trace!("Got response: {}", scraper.html);
-        }
-        Err(e) => {
-            e.log_error("parser getting HTML response");
-            return Err(());
-        }
-    };
-    info!("Got HTML response");
-
-    // Parse the HTML response
-    info!("Parsing HTML response...");
-    let parsed_response = match scraper.parse() {
-        Ok(_) => {
-            scraper.parsed_response.unwrap() // safe to unwrap, not error'd
-        }
-        Err(e) => {
-            e.log_error("parsing");
-            return Err(());
-        }
-    };
-    info!("Information for {}", command);
-    print!("\n{}\n", parsed_response);
-
-    // Run the install commands
-    if arguments.run_install_command {
-        // We're allowed to, so let's do it
-        let mut command_runner = CommandRunner::new(parsed_response);
-        println!();
-        match command_runner.get_install_command(None) {
-            Ok(install_commands) => {
-                command_runner.command_string = Some(install_commands.join("; "));
-                command_runner.commands = Some(install_commands);
-            }
-            Err(e) => {
-                e.log_error("getting install command");
-                return Err(());
-            }
-        }
-        if !command_runner.ask_should_run_command() {
-            return Ok(());
-        }
-        match command_runner.run_install_command() {
-            Ok(()) => (),
-            Err(e) => {
-                e.log_error("running install command");
-                return Err(());
-            }
-        }
+        Self { arguments, logger }
     }
 
-    Ok(())
+    /// Setup the logger
+    fn setup_logger(&mut self) {
+        let logger = self.logger.clone();
+        let columns = self.logger.columns;
+        LoggerBuilder::from_env(Env::new().default_write_style_or("always"))
+            // Verbose mode for this module if needed
+            .filter_module(
+                "command_is_now_found_cli",
+                match self.arguments.verbose {
+                    true => LevelFilter::Debug,
+                    false => LevelFilter::Info,
+                },
+            )
+            // Don't have verbose on for any other module
+            .filter(None, LevelFilter::Info)
+            // Formatting
+            .format(move |buffer, record| logger.format_write(buffer, record))
+            .target(Target::Stderr) /* for removing of status message with 2>/dev/null
+             *                                       as the output gets sent to stdout */
+            .init();
+
+        debug!(
+            "Number of columns: {}, exceeds minimum for single line statussing \
+            (not in verbose) {}: {}",
+            columns,
+            MIN_COLUMN_SINGLE_LINE_STATUS,
+            (columns > MIN_COLUMN_SINGLE_LINE_STATUS)
+        );
+    }
+
+    /// Run everything after stuff has been set up
+    /// Main logic
+    fn run(&mut self) -> Result<(), ()> {
+        /* Find information */
+        let information_finder = InformationFinder::new();
+
+        // Find command
+        info!("Finding command...");
+        let command = match self.arguments.command.is_empty() {
+            true => {
+                println!();
+                let command = information_finder.ask_command();
+                self.arguments.command.push_str(command.as_str());
+                self.logger.go_back_to_log_single_line();
+                command
+            }
+            false => self.arguments.command.clone(),
+        };
+        info!("Found command: {}", command);
+
+        // Find distribution
+        info!("Finding distribution...");
+        let distribution = match self.arguments.find_preferred_distribution {
+            true => match information_finder.find_distribution_automatically() {
+                Ok(distribution) => distribution,
+                Err(e) => {
+                    e.log_error("finding distribution");
+                    self.arguments.preferred_distribution.unwrap_or_default()
+                }
+            },
+            false => self.arguments.preferred_distribution.unwrap_or_default(),
+        };
+        info!("Found distribution: {}", distribution);
+
+        /* Scraper */
+        let mut scraper = Scraper::new(self.arguments.clone(), distribution);
+
+        // Get the HTML response
+        info!("Getting HTML response...");
+        match scraper.get_html_response() {
+            Ok(()) => {
+                trace!("Got response: {}", scraper.html);
+            }
+            Err(e) => {
+                e.log_error("parser getting HTML response");
+                return Err(());
+            }
+        };
+        info!("Got HTML response");
+
+        // Parse the HTML response
+        info!("Parsing HTML response...");
+        let parsed_response = match scraper.parse() {
+            Ok(_) => {
+                scraper.parsed_response.unwrap() // safe to unwrap, not error'd
+            }
+            Err(e) => {
+                e.log_error("parsing");
+                return Err(());
+            }
+        };
+        info!("Information for {}", command);
+        print!("\n{}\n", parsed_response);
+
+        // Run the install commands
+        if self.arguments.run_install_command {
+            // We're allowed to, so let's do it
+            let mut command_runner = CommandRunner::new(parsed_response);
+            println!();
+            match command_runner.get_install_command(None) {
+                Ok(install_commands) => {
+                    command_runner.command_string = Some(install_commands.join("; "));
+                    command_runner.commands = Some(install_commands);
+                }
+                Err(e) => {
+                    e.log_error("getting install command");
+                    return Err(());
+                }
+            }
+            if !command_runner.ask_should_run_command() {
+                return Ok(());
+            }
+            match command_runner.run_install_command() {
+                Ok(()) => (),
+                Err(e) => {
+                    e.log_error("running install command");
+                    return Err(());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
+/// Main
 fn main() {
-    // Get arguments
-    let mut arguments = Arguments::parse();
-    let verbose = arguments.verbose; // Will be moved in the logger format, don't use
+    let mut main = Main::new();
+    main.setup_logger();
 
-    // Logger
-    let columns = if let Some((Width(width), Height(_))) = terminal_size() {
-        width
-    } else {
-        UnknownError("Terminal size width returned None".to_string())
-            .log_error("getting terminal size");
-        80
-    };
+    debug!("{}", main.arguments);
 
-    LoggerBuilder::from_env(Env::new().default_write_style_or("always"))
-        // Verbose mode for this module if needed
-        .filter_module(
-            "command_is_now_found_cli",
-            match arguments.verbose {
-                true => LevelFilter::Debug,
-                false => LevelFilter::Info,
-            },
-        )
-        // Don't have verbose on for any other module
-        .filter(None, LevelFilter::Info)
-        // Formatting
-        .format(move |buffer, record| {
-            let level = record.level();
-            let mut style = buffer.style();
-            match record.level() {
-                Level::Error => style.set_color(EnvLoggerColor::Red),
-                Level::Info => style.set_color(EnvLoggerColor::Green),
-                Level::Warn => style.set_color(EnvLoggerColor::Yellow),
-                Level::Debug => style.set_color(EnvLoggerColor::Blue),
-                _ => style.set_color(EnvLoggerColor::Cyan),
-            };
-            style.set_bold(true);
-
-            // Split the arguments by newline, so we can prepend the text for every line
-            // If an error occurs, it'll only catch the first one, but then it'll stop execution
-            // of other write!'s
-            for result in record.args().to_string().split('\n').map(|line| {
-                // If verbose mode is deactivated and an info message is sent, then only show that on a
-                // single line and have that line change. However, if the terminal columns is too few,
-                // then do it normally again
-                let single_line_status = matches!(verbose, false if (
-                    record.level() == Level::Info &&
-                    columns > MIN_COLUMN_SINGLE_LINE_STATUS
-                ));
-                match write!(
-                    buffer,
-                    "{potential_clear}\r{file}:{line} {time} : \
-                    {log_level}{log_level_potential_padding} : \
-                    {target} : \
-                    {message}{potential_newline}",
-                    // Do we need to clear for single status messages?
-                    potential_clear = {
-                        match single_line_status {
-                            // Should be \r'd already
-                            true => " ".to_string().repeat(columns.into()),
-                            false => "".to_string(),
-                        }
-                    },
-                    // Should we \r for single-line status messages or \n?
-                    potential_newline = {
-                        match single_line_status {
-                            true => "\r".to_string(),
-                            false => "\n".to_string(),
-                        }
-                    },
-                    file = record.file().unwrap_or("unknown"),
-                    line = format_args!("{:0>4}", record.line().unwrap_or(0)),
-                    time = Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    log_level = style.value(level),
-                    log_level_potential_padding = match level {
-                        Level::Info => " ",
-                        _ => "",
-                    },
-                    target = record.target(),
-                    message = line
-                ) {
-                    Ok(_) => {
-                        buffer.flush()?;
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }) {
-                result?
-            }
-            Ok(())
-        })
-        .target(Target::Stderr) /* for removing of status message with 2>/dev/null
-         *                                       as the output gets sent to stdout */
-        .init();
-
-    debug!(
-        "Number of columns: {}, exceeds minimum for single line statussing \
-        (not in verbose) {}: {}",
-        columns,
-        MIN_COLUMN_SINGLE_LINE_STATUS,
-        (columns > MIN_COLUMN_SINGLE_LINE_STATUS)
-    );
-
-    debug!("{}", arguments);
-
+    // Run
     info!("Running");
-    match run(&mut arguments) {
+    match main.run() {
         Ok(()) => (),
         Err(()) => GeneralError("Fatal error, exiting!".to_string()).log_error("run exited"),
     };
