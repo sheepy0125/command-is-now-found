@@ -851,7 +851,34 @@ impl Scraper {
             .collect::<Vec<CommandParsed>>();
 
         match selector_type {
-            SelectorType::Command(_) => Ok(Some(distributions)),
+            SelectorType::Command(distribution) => {
+                use Distribution::*;
+                match distribution {
+                    // If the distribution is all distributions, great!
+                    // We can return what we have
+                    All => Ok(Some(distributions)),
+                    // Otherwise, we have to find the distribution that we need
+                    _ => {
+                        let found = distributions
+                            .iter()
+                            .find(|command_parsed| command_parsed.distribution == distribution);
+
+                        match found {
+                            Some(found) => {
+                                // For some reason, I couldn't use .to_owned() to get an owned
+                                // struct. Take this hacky workaround instead! (please fix XXX)
+                                let found_owned = CommandParsed {
+                                    is_preferred_distribution: found.is_preferred_distribution,
+                                    distribution: found.distribution,
+                                    install_commands: found.install_commands.clone(),
+                                };
+                                Ok(Some(vec![found_owned]))
+                            }
+                            None => Ok(None),
+                        }
+                    }
+                }
+            }
             _ => Err(CommandWasError::ParseError(
                 "Didn't get a command selector for handling of a command selector".to_string(),
             )),
@@ -859,6 +886,7 @@ impl Scraper {
     }
     /// Wrapper for parsing commands
     /// Will return an empty Vec if there's an error after logging the error
+    /// or if there's no information for the preferred distribution
     fn get_command_selector_wrapper(&self, selector: SelectorType) -> Vec<CommandParsed> {
         let log_level = "parsing commands";
 
@@ -869,7 +897,6 @@ impl Scraper {
                     // So, we didn't get the response we needed. Because we know the page
                     // existed from the redirect handler, this is the selected distribution
                     // being nonexistent
-
                     match selector {
                         // Sanity check (could happen when the scraper breaks)
                         SelectorType::Command(distribution)
