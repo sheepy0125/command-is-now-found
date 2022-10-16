@@ -77,6 +77,9 @@ enum CommandWasError {
     /// Unknown error
     #[error("What? An unknown error occurred, sorry(!): {0}")]
     UnknownError(String),
+    /// General error
+    #[error("{0}")]
+    GeneralError(String),
 }
 /// Implicitly convert reqwest errors
 impl From<reqwest::Error> for CommandWasError {
@@ -154,7 +157,13 @@ impl Display for Distribution {
 #[derive(ClapParser, Clone)]
 struct Arguments {
     /// The command to find (if auto-find is disabled)
-    #[clap(short, short = 'c', long = "command", conflicts_with("find-command"))]
+    #[clap(
+        short = 'c',
+        long = "command",
+        conflicts_with("find-command"),
+        default_value = "",
+        parse(try_from_str)
+    )]
     command: String,
 
     /// What to prepend before the commands
@@ -165,8 +174,8 @@ struct Arguments {
     #[clap(
         short = 'p',
         long = "prepend-before-commands",
-        parse(try_from_str),
-        default_value = "sudo"
+        default_value = "sudo",
+        parse(try_from_str)
     )]
     prepend_before_commands: String,
 
@@ -174,12 +183,12 @@ struct Arguments {
     ///
     /// See `prepend-before-commands`, with this on the commands won't be modified
     #[clap(
-        long = "should-prepend",
-        // conflicts_with = "prepend-before-commands",
-        parse(try_from_str),
-        default_value = "true"
+        short = 'n',
+        long = "no-prepend",
+        conflicts_with = "prepend-before-commands",
+        takes_value = false
     )]
-    should_prepend: bool,
+    no_prepend: bool,
 
     /// Distribution to get (if auto-find is disabled)
     ///
@@ -201,8 +210,8 @@ struct Arguments {
     #[clap(
         short = 'f',
         long = "find-command",
-        parse(try_from_str),
-        default_value = "false"
+        conflicts_with = "command",
+        takes_value = false
     )]
     find_command: bool,
 
@@ -211,28 +220,19 @@ struct Arguments {
     /// This will run the command for the preferred distribution gathered from the website
     ///
     /// Note: You will have to confirm the command before it can be ran
-    #[clap(
-        short = 'r',
-        long = "run_install_command",
-        parse(try_from_str),
-        default_value = "false"
-    )]
+    #[clap(short = 'r', long = "run_install_command", takes_value = false)]
     run_install_command: bool,
 
     /// Automatically find the distribution to search for
     ///
     /// This will detect your distribution from `/etc/os-release`'s ID or ID_LIKE
-    #[clap(
-        long = "find-preferred-distribution",
-        parse(try_from_str),
-        default_value = "false"
-    )]
+    #[clap(short = 'i', long = "find-preferred-distribution", takes_value = false)]
     find_preferred_distribution: bool,
 
     /// Verbose
     ///
     /// This will show more (mostly debug) logs
-    #[clap(long = "verbose", parse(try_from_str), default_value = "false")]
+    #[clap(long = "verbose", takes_value = false)]
     verbose: bool,
 }
 /// Display (mostly for DEBUG)
@@ -294,6 +294,20 @@ impl InformationFinder {
                 "Distribution detected ({}) is not a valid distribution",
                 &distribution
             ))),
+        }
+    }
+
+    /// Ask the user for the command. Will re-ask until a valid response is given
+    fn ask_command(&self) -> String {
+        let log_level = "asking user for command";
+
+        match Question::new("Enter a command:").ask() {
+            Some(Answer::RESPONSE(none)) if none.is_empty() => {
+                GeneralError("Command cannot be empty".to_string()).log_error(log_level);
+                self.ask_command()
+            }
+            Some(Answer::RESPONSE(command)) => command,
+            _ => panic!("Response was not a response. How did this happen?"),
         }
     }
 }
@@ -617,8 +631,6 @@ impl Scraper {
             .filter_map(|distribution| {
                 // Attempt to find the command from the HTML
                 // Sometimes, it'll just not be there
-                // Attempt to find the command from the HTML
-                // Sometimes, it'll just not be there
                 let distribution_selector = SelectorType::Command(distribution);
                 let parsed_distribution_selector = match self.parse_selector(&distribution_selector)
                 {
@@ -626,7 +638,10 @@ impl Scraper {
                     Ok(parsed) if parsed.is_some() => parsed.unwrap(), // Some (unwrapping is safe)
                     Ok(_parsed) => return None,                        // None
                     Err(_) => {
-                        error!("Error with selector {:?}!", selector_type);
+                        GeneralError(format!("Error with selector {:?}!", selector_type))
+                            .log_error(
+                                format!("selector for distribution {}", distribution).as_str(),
+                            );
                         return None; // skip distribution
                     }
                 };
@@ -644,7 +659,7 @@ impl Scraper {
                     // Prepend to commands
                     .map(|text| {
                         // Should we?
-                        if !self.arguments.should_prepend {
+                        if self.arguments.no_prepend {
                             // We shalln't!
                             return text;
                         }
@@ -895,9 +910,24 @@ impl CommandRunner {
     }
 }
 
-fn run(arguments: Arguments) -> Result<(), ()> {
+fn run(arguments: &mut Arguments) -> Result<(), ()> {
+    let mut arguments = arguments.clone();
+
     /* Find information */
     let information_finder = InformationFinder::new();
+
+    // Find command
+    info!("Finding command...");
+    let command = match arguments.command.is_empty() {
+        true => {
+            println!();
+            let command = information_finder.ask_command();
+            arguments.command.push_str(command.as_str());
+            command
+        }
+        false => arguments.command.clone(),
+    };
+    info!("Found command: {}", command);
 
     // Find distribution
     info!("Finding distribution...");
@@ -940,7 +970,7 @@ fn run(arguments: Arguments) -> Result<(), ()> {
             return Err(());
         }
     };
-    info!("Information for {}", arguments.command);
+    info!("Information for {}", command);
     print!("\n{}\n", parsed_response);
 
     // Run the install commands
@@ -975,7 +1005,7 @@ fn run(arguments: Arguments) -> Result<(), ()> {
 
 fn main() {
     // Get arguments
-    let arguments = Arguments::parse();
+    let mut arguments = Arguments::parse();
     let verbose = arguments.verbose; // Will be moved in the logger format, don't use
 
     // Logger
@@ -1080,10 +1110,8 @@ fn main() {
     debug!("{}", arguments);
 
     info!("Running");
-    match run(arguments) {
+    match run(&mut arguments) {
         Ok(()) => (),
-        Err(()) => {
-            error!("Fatal error, exiting!")
-        }
+        Err(()) => GeneralError("Fatal error, exiting!".to_string()).log_error("run exited"),
     };
 }
