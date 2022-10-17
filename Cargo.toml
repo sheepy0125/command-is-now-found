@@ -1,12 +1,10 @@
 [package]
-name = "command-is-now-found-cli"
-version = "0.1.0"
+name = "command-is-now-found"
+version = "1.0.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-clap = { version = "3.2.20", features = ["derive"] }  # I don't want to deal with the API breakage
+clap = { version = "3.2.20", features = ["derive"] }  # I don't want to deal with the API breakage (I blame DuckDuckGo for giving me a link to outdated docs)
 pretty_env_logger = "0.4.0"
 os-release = "0.1.0"
 reqwest = { version = "0.11.11", features = ["blocking"] }
