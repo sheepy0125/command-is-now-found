@@ -101,12 +101,13 @@ impl CommandWasError {
 use CommandWasError::*;
 
 /// Distribution
-/// There are actually more on the website, however, if they're from the same package
-/// manager there's an almost certain chance they will be the same command
 #[derive(Debug, ArgEnum, Clone, Copy, PartialEq)]
 enum Distribution {
     Arch,
     Debian,
+    Ubuntu,
+    Kali,
+    Raspbian,
     Fedora,
     Alpine,
     CentOS,
@@ -122,14 +123,10 @@ impl Default for Distribution {
 }
 /// Displaying and converting to and from Strings
 impl Distribution {
-    /// Used for Clap
+    /// Used for Clap and iterating
     const POSSIBLE_VALUES: &'static [&'static str] = &[
         "arch", "debian", "ubuntu", "kali", "raspbian", "fedora", "alpine", "centos", "windows",
     ];
-
-    /// Used for iterating
-    const ALL_DISTRIBUTIONS: &'static [&'static str] =
-        &["arch", "debian", "fedora", "alpine", "centos", "windows"];
 }
 impl FromStr for Distribution {
     type Err = ();
@@ -138,14 +135,14 @@ impl FromStr for Distribution {
         match input.to_lowercase().as_str() {
             "arch" => Ok(Self::Arch),
             "debian" => Ok(Self::Debian),
-            "ubuntu" => Ok(Self::Debian),
-            "kali" => Ok(Self::Debian),
-            "raspbian" => Ok(Self::Debian),
+            "ubuntu" => Ok(Self::Ubuntu),
+            "kali" => Ok(Self::Kali),
+            "raspbian" => Ok(Self::Raspbian),
             "fedora" => Ok(Self::Fedora),
             "alpine" => Ok(Self::Alpine),
             "centos" => Ok(Self::CentOS),
             "windows" => Ok(Self::Windows),
-            _ => Err(()), // this will cause a panic?!
+            _ => Err(()), // this will cause a panic!?
         }
     }
 }
@@ -214,7 +211,7 @@ impl Logger {
             cursor_y_pos -= 1;
             print!("{}", self.clear_line());
             match execute!(stdout(), cursor::MoveUp(1)) {
-                Ok(()) => (),
+                Ok(_) => (),
                 Err(e) => {
                     GeneralError(format!("Failed to move cursor up: {}", e)).log_error(log_level)
                 }
@@ -307,27 +304,16 @@ impl Logger {
 /// Arguments
 #[derive(ClapParser, Clone)]
 struct Arguments {
-    /// The command to find (if auto-find is disabled)
-    #[clap(
-        short = 'c',
-        long = "command",
-        conflicts_with("find-command"),
-        default_value = "",
-        parse(try_from_str)
-    )]
+    /// The command to find
+    #[clap(short = 'c', long = "command", default_value = "", parse(try_from_str))]
     command: String,
 
     /// What to prepend before the commands
     ///
     /// For example, most install commands will need to be ran as root with `sudo`
-    /// `command-not-found.com` uses sudo rarely, and will be excluded before something
-    /// gets prepended
-    #[clap(
-        short = 'p',
-        long = "prepend-before-commands",
-        default_value = "sudo",
-        parse(try_from_str)
-    )]
+    /// `command-not-found.com` uses solely sudo rarely, and will be excluded before
+    /// something gets prepended (so there won't be any `sudo sudo`)
+    #[clap(short = 'p', long = "prepend-before-commands", default_value = "sudo")]
     prepend_before_commands: String,
 
     /// Don't prepend anything before the commands
@@ -349,22 +335,11 @@ struct Arguments {
         long = "distribution",
         possible_values = Distribution::POSSIBLE_VALUES,
         conflicts_with = "find-preferred-distribution",
-        ignore_case = true
+        ignore_case = true,
+        // parse(try_from_str = Distribution::try_from)
+        arg_enum
     )]
-    #[clap(arg_enum)]
     preferred_distribution: Option<Distribution>,
-
-    /// Automatically find the command to find
-    ///
-    /// This will detect the command from your shell history file (whatever command was
-    /// ran before this program)
-    #[clap(
-        short = 'f',
-        long = "find-command",
-        conflicts_with = "command",
-        takes_value = false
-    )]
-    find_command: bool,
 
     /// Automatically run the command that was found
     ///
@@ -382,7 +357,7 @@ struct Arguments {
 
     /// Verbose
     ///
-    /// This will show more (mostly debug) logs
+    /// This will show more (and debug) logs
     #[clap(long = "verbose", takes_value = false)]
     verbose: bool,
 }
@@ -395,14 +370,12 @@ impl Display for Arguments {
             Arguments:\n \
             Command: {} \n \
             Run install command: {}\n \
-            Find command: {}\n \
             Preferred distribution: {}\n \
             Find preferred distribution: {}\n \
             Verbose: {} \
             ",
             self.command,
             self.run_install_command,
-            self.find_command,
             self.preferred_distribution.unwrap_or_default(),
             self.find_preferred_distribution,
             self.verbose
@@ -425,7 +398,7 @@ impl InformationFinder {
             Ok(release) => release,
             Err(e) => return Err(AutoDetectError(format!("{}", e))),
         };
-        let mut distribution = release.id_like;
+        let mut distribution: String = release.id_like.split(' ').next().unwrap_or_default().into();
         // Sometimes, the id_like won't be specified (this API will return an empty string in that case)
         // So, we'll need to use the other ID
         if (&distribution).is_empty() {
@@ -658,7 +631,11 @@ impl Scraper {
         };
 
         self.html = match client
-            .get(format!("http://localhost:8090/{}", self.arguments.command))
+            .get(format!(
+                // "http://localhost:8090/{}", // DEBUG
+                "https://command-not-found.com/{}",
+                self.arguments.command
+            ))
             .send()?
             .text()
         {
@@ -780,7 +757,7 @@ impl Scraper {
         selector_type: SelectorType,
     ) -> Result<Option<Vec<CommandParsed>>, CommandWasError> {
         // Get commands for every distribution
-        let distributions = Distribution::ALL_DISTRIBUTIONS
+        let distributions = Distribution::POSSIBLE_VALUES
             .iter()
             .map(|distribution| <Distribution as FromStr>::from_str(distribution).unwrap())
             .filter_map(|distribution| {
@@ -1014,7 +991,7 @@ impl CommandRunner {
     /// Note: this is not in InformationFinder as it has specific stuff relating to validation
     fn ask_preferred_distribution(&self) -> Option<Distribution> {
         let sentinel_none = "none";
-        let mut acceptable_answers = Vec::from(Distribution::ALL_DISTRIBUTIONS);
+        let mut acceptable_answers = Vec::from(Distribution::POSSIBLE_VALUES);
         acceptable_answers.push(sentinel_none);
         match Question::new(
             format!(
@@ -1180,9 +1157,7 @@ impl Main {
         // Get the HTML response
         info!("Getting HTML response...");
         match scraper.get_html_response() {
-            Ok(()) => {
-                trace!("Got response: {}", scraper.html);
-            }
+            Ok(_) => (),
             Err(e) => {
                 e.log_error("parser getting HTML response");
                 return Err(());
@@ -1223,7 +1198,7 @@ impl Main {
                 return Ok(());
             }
             match command_runner.run_install_command() {
-                Ok(()) => (),
+                Ok(_) => (),
                 Err(e) => {
                     e.log_error("running install command");
                     return Err(());
@@ -1245,7 +1220,7 @@ fn main() {
     // Run
     info!("Running");
     match main.run() {
-        Ok(()) => (),
+        Ok(_) => (),
         Err(()) => GeneralError("Fatal error, exiting!".to_string()).log_error("run exited"),
     };
 }
