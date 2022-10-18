@@ -38,8 +38,7 @@ OPTIONS:
 
     -d, --distribution <PREFERRED_DISTRIBUTION>
             Distribution to get (if auto-find is disabled) [possible values: arch, debian, ubuntu,
-            kali, raspbian, fedora, alpine, cent-os, windows, all, arch, debian, ubuntu, kali,
-            raspbian, fedora, alpine, centos, windows]
+            kali, raspbian, fedora, alpine, cent-os, windows, all]
 
     -h, --help
             Print help information

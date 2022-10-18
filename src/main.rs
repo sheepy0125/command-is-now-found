@@ -123,7 +123,7 @@ impl Default for Distribution {
 }
 /// Displaying and converting to and from Strings
 impl Distribution {
-    /// Used for Clap and iterating
+    /// Used for iterating
     const POSSIBLE_VALUES: &'static [&'static str] = &[
         "arch", "debian", "ubuntu", "kali", "raspbian", "fedora", "alpine", "centos", "windows",
     ];
@@ -333,10 +333,8 @@ struct Arguments {
     #[clap(
         short = 'd',
         long = "distribution",
-        possible_values = Distribution::POSSIBLE_VALUES,
         conflicts_with = "find-preferred-distribution",
         ignore_case = true,
-        // parse(try_from_str = Distribution::try_from)
         arg_enum
     )]
     preferred_distribution: Option<Distribution>,
@@ -632,8 +630,8 @@ impl Scraper {
 
         self.html = match client
             .get(format!(
-                // "http://localhost:8090/{}", // DEBUG
-                "https://command-not-found.com/{}",
+                "http://localhost:8090/{}", // DEBUG
+                // "https://command-not-found.com/{}",
                 self.arguments.command
             ))
             .send()?
