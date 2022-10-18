@@ -1,10 +1,8 @@
 # Command is now found
 
-### Release 1.0.0
-
 A simple-but-powerful tool to scrape [command-not-found.com](https://command-not-found.com) (which I did not make, see [Disclaimer](#disclaimer)) as the only public API available is for Alpine Linux.
 
-## Features / road-map
+## Features
 - [x] Scrapes [command-not-found.com](https://command-not-found.com)  
 - [x] Gives a summary of the commands for each distribution  
 - [x] Can auto-determine the distribution to look for (opt-in)  
