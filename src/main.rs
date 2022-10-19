@@ -48,15 +48,15 @@ use scraper::{ElementRef, Html, Node::Text, Selector};
 
 use reqwest::{blocking::Client, redirect::Policy as RedirectPolicy};
 
-/* Statics */
+/***** Statics *****/
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 static MIN_COLUMN_SINGLE_LINE_STATUS: u16 = 60;
 static DEFAULT_ANSWER_YES_FOR_RUNNING_COMMAND: bool = false;
 
-/* Type aliases */
+/***** Type aliases *****/
 type InstallCommands = Vec<String>;
 
-/* Enums */
+/***** Enums *****/
 /// Error
 #[derive(Error, Debug, PartialEq)]
 enum CommandWasError {
@@ -85,6 +85,7 @@ enum CommandWasError {
     #[error("{0}")]
     GeneralError(String),
 }
+use CommandWasError::*;
 /// Implicitly convert reqwest errors
 impl From<reqwest::Error> for CommandWasError {
     fn from(e: reqwest::Error) -> Self {
@@ -97,8 +98,6 @@ impl CommandWasError {
         error!(target: target.to_lowercase().replace(' ', "_").as_str(), "{}", self);
     }
 }
-
-use CommandWasError::*;
 
 /// Distribution
 #[derive(Debug, ArgEnum, Clone, Copy, PartialEq)]
@@ -152,7 +151,7 @@ impl Display for Distribution {
     }
 }
 
-/* Structs */
+/***** Structs *****/
 
 /// Logger handler
 #[derive(Clone)]
@@ -161,7 +160,6 @@ struct Logger {
     columns: u16,
     starting_y_pos: u16,
 }
-
 impl Logger {
     fn new(verbose: bool) -> Self {
         Self {
@@ -435,12 +433,15 @@ impl InformationFinder {
 }
 
 /***** Parser *****/
+
+/// Command parsed
 struct CommandParsed {
     is_preferred_distribution: bool,
     distribution: Distribution,
     install_commands: InstallCommands,
 }
 
+/// Parsed response
 #[derive(Default)]
 struct ParsedResponse {
     maintainer: Option<String>,
@@ -449,7 +450,6 @@ struct ParsedResponse {
     description: Option<String>,
     commands: Vec<CommandParsed>,
 }
-/// Display
 impl Display for ParsedResponse {
     fn fmt(&self, f: &mut StdFormatter) -> std::fmt::Result {
         let label_style = Style::new().fg(AnsiTermColor::White).bold();
@@ -581,7 +581,7 @@ impl SelectorType {
     }
 }
 
-/* Scraper */
+/// Scraper
 struct Scraper {
     arguments: Arguments,
     distribution: Distribution,
@@ -630,8 +630,8 @@ impl Scraper {
 
         self.html = match client
             .get(format!(
-                "http://localhost:8090/{}", // DEBUG
-                // "https://command-not-found.com/{}",
+                // "http://localhost:8090/{}", // DEBUG
+                "https://command-not-found.com/{}",
                 self.arguments.command
             ))
             .send()?
@@ -744,7 +744,10 @@ impl Scraper {
         match self.get_card_box_selector(selector) {
             Ok(result) => result,
             Err(e) => {
-                e.log_error("parsing card box");
+                // Don't log the error if not in verbose mode as it could just not exist
+                if self.arguments.verbose {
+                    e.log_error("parsing card box");
+                }
                 None
             }
         }
@@ -924,7 +927,7 @@ impl Scraper {
     }
 }
 
-/* Command runner */
+/// Command runner
 struct CommandRunner {
     parsed_response: ParsedResponse,
     commands: Option<InstallCommands>,
