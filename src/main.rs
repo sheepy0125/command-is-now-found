@@ -1060,7 +1060,9 @@ impl CommandRunner {
 
     /// Run an install command without blocking
     /// This will return an error if the command couldn't be ran
+    /// and will also wait for the command to finish run
     fn run_install_command(&self) -> Result<(), CommandWasError> {
+        // TODO: Refactor to not have a bunch of nested matches
         match Command::new("sh")
             .arg("-c")
             .arg(self.command_string.as_ref().unwrap().as_str()) // safe to unwrap, not called when None
@@ -1069,7 +1071,20 @@ impl CommandRunner {
             .stderr(Stdio::inherit())
             .spawn()
         {
-            Ok(_) => Ok(()),
+            Ok(mut child) => {
+                match child.try_wait() {
+                    Ok(Some(code)) => {
+                        debug!("Process exited right away with code {}", code);
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        let code = child.wait().expect("Failed to get code when waiting for process to exit");
+                        debug!("Process exited with code {}", code);
+                        Ok(())
+                    }
+                    Err(e) => Err(AutoRunErrorCommand(format!("Failed waiting to exit: {}", e)))
+                }
+            }
             Err(e) => Err(AutoRunErrorCommand(e.to_string())),
         }
     }
